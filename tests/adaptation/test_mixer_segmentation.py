@@ -159,6 +159,38 @@ class TestSegmentedApplication:
                                             dtype=torch.float32)
         assert torch.allclose(stream[:, 0], expected)
 
+    def test_gather_never_applies_to_sequence_mixers(self):
+        # use_gather=True would hand the mixer a non-contiguous subset
+        # of member tokens; a sequence mixer must instead see the full
+        # request span, with the mask restricted to the blend.
+        layer = nn.Module()
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
+        adapter = CumsumMixingAdapter()
+        _add_adapter_to_layer(layer, 1, adapter, "all", torch.device("cpu"))
+        # Single prefill request of 4 tokens; only tokens 1 and 3 are
+        # members.  The cumsum must run over all 4 tokens and the mask
+        # gate the blend: token j gets delta 2*(j+1) iff member.
+        token_ids = torch.tensor([0, 1, 0, 1], dtype=torch.int32)
+        qsl = torch.tensor([0, 4])
+        update_adapter_position_masks(
+            [layer], token_ids, torch.arange(4),
+            _meta(4, 0, 1, query_start_loc=qsl), 4, use_gather=True)
+        hidden = torch.ones(4, HIDDEN)
+        residual = torch.ones(4, HIDDEN)
+
+        def super_forward(positions, hidden_states, residual):
+            return hidden_states, residual
+
+        h, r = _multi_adapter_forward(layer, torch.arange(4), hidden,
+                                   residual, super_forward=super_forward)
+        stream = h + r
+        expected = 2.0 + 2.0 * torch.tensor([0, 2, 0, 4],
+                                            dtype=torch.float32)
+        assert torch.allclose(stream[:, 0], expected)
+        # The mixer saw the full span exactly once, not the 2-token
+        # gathered subset.
+        assert adapter.seen_token_counts == [4]
+
     def test_graph_safe_mode_does_not_segment(self):
         # Dynamic per-request segment counts are not graph-representable;
         # graph mode keeps the flattened application (and dynamic adapter

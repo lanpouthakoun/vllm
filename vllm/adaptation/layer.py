@@ -827,6 +827,7 @@ def _compute_batch_segments(resolved_meta,
 
 
 _seq_mixing_graph_mode_warned = False
+_seq_mixing_no_segments_warned = False
 
 
 def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
@@ -879,6 +880,16 @@ def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
                 out[start:end] = apply_adaptation(adapter,
                                                   hidden[start:end], mask)
             return out
+        # Single segment (or no boundary info): the full-batch masked
+        # path below is the correct application — the mixer must see
+        # the whole contiguous span, with the mask applied to the
+        # blend only.  Never fall into the gather path: gathering
+        # hands the mixer a non-contiguous subset of member tokens,
+        # silently changing what "the sequence" is.
+        mask_buf = layer._adapter_combined_masks.get(int_id)
+        num_tokens = hidden.shape[0]
+        mask = mask_buf[:num_tokens] if mask_buf is not None else None
+        return apply_adaptation(adapter, hidden, mask)
 
     member_idx = getattr(layer, "_adapter_member_indices", {}).get(int_id)
     if member_idx is not None:
@@ -1155,6 +1166,20 @@ def update_adapter_position_masks(
         else:
             batch_segments = _compute_batch_segments(resolved_meta,
                                                      num_tokens)
+            if batch_segments is None:
+                (_npt, _nd, _np_, _qsl, _) = _get_prefill_info(resolved_meta)
+                multi_request = (_npt is not None and _qsl is None
+                                 and _np_ > 1)
+                if multi_request:
+                    global _seq_mixing_no_segments_warned
+                    if not _seq_mixing_no_segments_warned:
+                        _seq_mixing_no_segments_warned = True
+                        logger.warning(
+                            "Sequence-mixing adaptations are loaded but "
+                            "request boundaries could not be determined "
+                            "for a multi-prefill batch (no query_start_loc "
+                            "in attention metadata); mixing may leak "
+                            "across request boundaries this step.")
 
     # Compute the set of adapter IDs actually referenced in this batch.
     # One .unique() call on a small 1-D int tensor — fast, no GPU sync
