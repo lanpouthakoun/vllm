@@ -28,6 +28,7 @@ __all__ = [
     "PhaseInfo",
     "get_position_mask",
     "position_active_in_decode",
+    "position_prompt_anchored",
     "register_position_mask",
     "registered_positions",
 ]
@@ -246,6 +247,23 @@ def get_position_mask(name: str, positions: torch.Tensor,
             "'every_<k>' / 'every_<k>_offset_<j>' family). Use "
             "vllm.adaptation.register_position_mask() to add custom ones.")
     return entry.fn(positions, dtype, num_tokens, phase)
+
+
+def position_prompt_anchored(name: str) -> bool:
+    """Whether this position's mask anchors to absolute position id 0.
+
+    True for ``"first"`` (fires only where ``position == 0``) and the
+    prompt-anchored ``every_<k>[_offset_<j>]`` family (``pos % k``).
+    Under an externally injected KV prefix (kv_transfer connector), the
+    first locally computed token sits at position ``prefix_len``, not 0:
+    ``"first"`` masks are then dead (position 0 never enters the model)
+    and ``every_<k>`` re-anchors to the prefix-shifted ids.  The
+    generation-anchored families (``*_decode``, ``decode_range``) are
+    unaffected — they subtract the per-request prompt length.
+    """
+    if name == "first":
+        return True
+    return _EVERY_K_RE.match(name) is not None
 
 
 def position_active_in_decode(name: str) -> bool:

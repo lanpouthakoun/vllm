@@ -41,6 +41,7 @@ batching, reordering, and preemption.  Loading one raises.
 
 from vllm.adaptation.positions import (PhaseInfo, get_position_mask,
                                        position_active_in_decode,
+                                       position_prompt_anchored,
                                        register_position_mask,
                                        registered_positions)
 from vllm.adaptation.protocol import (MOUNT_SITES, apply_adaptation,
@@ -53,6 +54,7 @@ __all__ = [
     "PhaseInfo",
     "get_position_mask",
     "position_active_in_decode",
+    "position_prompt_anchored",
     "register_position_mask",
     "registered_positions",
     "MOUNT_SITES",

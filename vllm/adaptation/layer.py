@@ -1452,6 +1452,49 @@ def make_adapter_decoder_layer(base_layer_cls: type,
     return AdapterDecoderLayer
 
 
+_prefix_position_warned: set = set()
+
+
+def warn_if_prefix_incompatible_position(position: str, vllm_config) -> None:
+    """Warn (once per position) when a prompt-anchored position is used
+    while the engine injects an external KV prefix.
+
+    The PrefixInjectionConnector marks the first ``prefix_len`` prompt
+    tokens as externally computed, so the first token entering the model
+    sits at position ``prefix_len``: ``"first"`` masks are silently dead
+    and ``every_<k>`` masks re-anchor to prefix-shifted position ids.
+    This cannot be detected inside the mask functions (a prefix-injected
+    first chunk is indistinguishable from a chunked-prefill continuation
+    there), so the guard lives at adapter load/config time.
+    """
+    try:
+        ktc = getattr(vllm_config, "kv_transfer_config", None)
+        if ktc is None:
+            return
+        if getattr(ktc, "kv_connector", None) != "PrefixInjectionConnector":
+            return
+        prefix_len = int(ktc.get_from_extra_config("prefix_len", 0))
+    except Exception:
+        return
+    if prefix_len <= 0:
+        return
+    from vllm.adaptation.positions import position_prompt_anchored
+    if not position_prompt_anchored(position):
+        return
+    if position in _prefix_position_warned:
+        return
+    _prefix_position_warned.add(position)
+    logger.warning(
+        "Adapter position %r is anchored to absolute position 0, but "
+        "PrefixInjectionConnector injects an external KV prefix of "
+        "%d tokens: the first locally computed token sits at position "
+        "%d, so this mask is dead ('first') or re-anchored "
+        "('every_<k>'). Use a generation-anchored position "
+        "(e.g. 'every_<k>_decode', 'first_<k>_decode') or a "
+        "custom position that accounts for the prefix.",
+        position, prefix_len, prefix_len)
+
+
 def maybe_adapter_layer_type(vllm_config, default_cls: type,
                           arch: Optional[str] = None) -> type:
     """Resolve the decoder-layer class for a model given its adapter config.
@@ -1467,6 +1510,8 @@ def maybe_adapter_layer_type(vllm_config, default_cls: type,
     if adapter_spec is None:
         adapter_spec = get_adapter_spec()
     if adapter_spec is not None:
+        warn_if_prefix_incompatible_position(
+            adapter_spec.get("position", "prefill"), vllm_config)
         return make_adapter_decoder_layer(default_cls, adapter_spec, arch=arch)
     if getattr(vllm_config, "enable_adapters", False):
         return make_adapter_decoder_layer(default_cls, None, arch=arch)

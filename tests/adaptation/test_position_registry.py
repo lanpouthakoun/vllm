@@ -147,3 +147,93 @@ class TestBackwardCompatDispatch:
         with pytest.raises(ValueError):
             _compute_position_mask(torch.arange(2), "bogus", torch.float32,
                                    2, _meta(2, 0, 1))
+
+
+class TestPromptAnchoredClassification:
+
+    @pytest.mark.parametrize("name", [
+        "first", "every_2", "every_16", "every_4_offset_1"])
+    def test_prompt_anchored(self, name):
+        from vllm.adaptation import position_prompt_anchored
+        assert position_prompt_anchored(name)
+
+    @pytest.mark.parametrize("name", [
+        "all", "all_tokens", "prefill", "decode", "decode_b", "last",
+        "every_2_decode", "every_4_decode_offset_1", "first_8_decode",
+        "decode_range_0_16", "custom_thing"])
+    def test_not_prompt_anchored(self, name):
+        from vllm.adaptation import position_prompt_anchored
+        assert not position_prompt_anchored(name)
+
+
+class TestPrefixIncompatibilityWarning:
+
+    def _config(self, connector, prefix_len):
+        extra = {"prefix_len": prefix_len}
+        ktc = SimpleNamespace(
+            kv_connector=connector,
+            get_from_extra_config=lambda key, default: extra.get(key,
+                                                                 default))
+        return SimpleNamespace(kv_transfer_config=ktc)
+
+    @staticmethod
+    def _capture_warnings():
+        """Handler-based capture (the vllm logger does not propagate)."""
+        import contextlib
+        import logging
+
+        @contextlib.contextmanager
+        def _cm():
+            records = []
+
+            class _H(logging.Handler):
+
+                def emit(self, record):
+                    records.append(record.getMessage())
+
+            log = logging.getLogger("vllm.adaptation.layer")
+            handler = _H(level=logging.WARNING)
+            log.addHandler(handler)
+            try:
+                yield records
+            finally:
+                log.removeHandler(handler)
+
+        return _cm()
+
+    def test_warns_for_first_under_prefix(self):
+        from vllm.adaptation.layer import (
+            _prefix_position_warned, warn_if_prefix_incompatible_position)
+        _prefix_position_warned.discard("first")
+        with self._capture_warnings() as records:
+            warn_if_prefix_incompatible_position(
+                "first", self._config("PrefixInjectionConnector", 64))
+        assert any("anchored to absolute position 0" in m for m in records)
+        # Once per position: repeated loads stay quiet.
+        with self._capture_warnings() as records:
+            warn_if_prefix_incompatible_position(
+                "first", self._config("PrefixInjectionConnector", 64))
+        assert not records
+
+    def test_silent_for_decode_anchored_position(self):
+        from vllm.adaptation.layer import warn_if_prefix_incompatible_position
+        with self._capture_warnings() as records:
+            warn_if_prefix_incompatible_position(
+                "every_4_decode", self._config("PrefixInjectionConnector", 64))
+            warn_if_prefix_incompatible_position(
+                "last", self._config("PrefixInjectionConnector", 64))
+        assert not records
+
+    def test_silent_without_prefix_connector(self):
+        from vllm.adaptation.layer import (
+            _prefix_position_warned, warn_if_prefix_incompatible_position)
+        _prefix_position_warned.discard("first")
+        with self._capture_warnings() as records:
+            warn_if_prefix_incompatible_position(
+                "first", self._config("SharedStorageConnector", 64))
+            warn_if_prefix_incompatible_position(
+                "first", self._config("PrefixInjectionConnector", 0))
+            warn_if_prefix_incompatible_position("first", None)
+            warn_if_prefix_incompatible_position(
+                "first", SimpleNamespace(kv_transfer_config=None))
+        assert not records

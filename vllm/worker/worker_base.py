@@ -242,6 +242,11 @@ class WorkerBase:
         """
         if site == "block_output":
             site = adapter_config.get("site", "block_output")
+        # Prompt-anchored positions silently break under an external
+        # KV prefix — warn at load time (undetectable at mask time).
+        from vllm.adaptation.layer import warn_if_prefix_incompatible_position
+        warn_if_prefix_incompatible_position(
+            position, getattr(self, "vllm_config", None))
         # Delegate to centralized manager when available.
         manager = self._get_adapter_manager()
         if manager is not None:
