@@ -91,9 +91,9 @@ class ShapeRecordingAdapter(nn.Module):
         self.marker = nn.Linear(1, 1)
         self.seen_token_counts: list[int] = []
 
-    def _compute_delta(self, h):
-        self.seen_token_counts.append(h.shape[-2])
-        return torch.full_like(h, self.value)
+    def readout(self, fx, state=None, x=None):
+        self.seen_token_counts.append(fx.shape[-2])
+        return fx + torch.full_like(fx, self.value)
 
 
 def _make_layer():

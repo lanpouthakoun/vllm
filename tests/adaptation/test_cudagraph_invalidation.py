@@ -114,8 +114,8 @@ class _ConstAdapter(nn.Module):
         super().__init__()
         self.marker = nn.Linear(1, 1)
 
-    def _compute_delta(self, h):
-        return torch.zeros_like(h)
+    def readout(self, fx, state=None, x=None):
+        return fx + torch.zeros_like(fx)
 
 
 def _fake_worker_with_layers(num_layers=2):

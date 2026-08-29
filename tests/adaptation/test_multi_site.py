@@ -46,8 +46,8 @@ class ConstDelta(nn.Module):
         self.value = value
         self.marker = nn.Linear(1, 1)
 
-    def _compute_delta(self, h):
-        return torch.full_like(h, self.value)
+    def readout(self, fx, state=None, x=None):
+        return fx + torch.full_like(fx, self.value)
 
 
 class TupleLinear(nn.Module):

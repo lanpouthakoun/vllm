@@ -32,7 +32,7 @@ def _adapter_with(mixer):
     adapter = nn.Module()
     adapter.lin = nn.Linear(4, 4)
     adapter.mixer = mixer
-    adapter._compute_delta = lambda h: h
+    adapter.readout = lambda fx, state=None, x=None: fx
     return adapter
 
 

@@ -43,8 +43,10 @@ def _make(name):
 
 
 def _delta(a, x):
+    # v3 T/R contract: leaves define readout (R); the serving-path
+    # correction is R(x) - x.
     with torch.no_grad():
-        return a._compute_delta(x)
+        return a.readout(x) - x
 
 
 @pytest.fixture(scope="module")

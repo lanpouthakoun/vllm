@@ -47,9 +47,9 @@ class CumsumMixingAdapter(nn.Module):
         self.mixer = _PlainMixer()
         self.seen_token_counts: list[int] = []
 
-    def _compute_delta(self, h):
-        self.seen_token_counts.append(h.shape[-2])
-        return torch.cumsum(h, dim=-2)
+    def readout(self, fx, state=None, x=None):
+        self.seen_token_counts.append(fx.shape[-2])
+        return fx + torch.cumsum(fx, dim=-2)
 
 
 class TokenLocalAdapter(nn.Module):
@@ -59,9 +59,9 @@ class TokenLocalAdapter(nn.Module):
         self.marker = nn.Linear(1, 1)
         self.seen_token_counts: list[int] = []
 
-    def _compute_delta(self, h):
-        self.seen_token_counts.append(h.shape[-2])
-        return h * 0.5
+    def readout(self, fx, state=None, x=None):
+        self.seen_token_counts.append(fx.shape[-2])
+        return fx + fx * 0.5
 
 
 class TestDetection:

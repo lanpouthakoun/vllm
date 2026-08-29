@@ -53,9 +53,9 @@ class RealisticStreamAdapter(nn.Module):
         else:
             self.register_buffer("_R_cache", R.clone(), persistent=False)
 
-    def _compute_delta(self, h):
-        source = self.learned_source(h)
-        return source @ self._R_cache
+    def readout(self, fx, state=None, x=None):
+        source = self.learned_source(fx)
+        return fx + source @ self._R_cache
 
 
 def _make_model(num_layers=2):
@@ -154,7 +154,7 @@ class TestInPlaceness:
                                      adapter_int_id=1)
         adapter = layers[0].served_adapters["1"]
         h = torch.ones(1, 3, HIDDEN)
-        delta = adapter._compute_delta(h)
+        delta = adapter.readout(h) - h
         # source = 0.5*8 + 0.5 = 4.5 per rank dim; delta = source @ R
         # with R = 0.5 everywhere: 4.5 * 0.5 * RANK = 9.0.
         assert torch.allclose(delta, torch.full((1, 3, HIDDEN), 9.0))

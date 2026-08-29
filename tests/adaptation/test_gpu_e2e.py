@@ -97,8 +97,8 @@ class BigDeltaAdapter(nn.Module):
         self.scale = nn.Parameter(
             torch.full((hidden_size, ), float(value)))
 
-    def _compute_delta(self, h):
-        return torch.ones_like(h) * self.scale.to(h.dtype)
+    def readout(self, fx, state=None, x=None):
+        return fx + torch.ones_like(fx) * self.scale.to(fx.dtype)
 
 
 def _adapter_config(hidden: int, value: float):
