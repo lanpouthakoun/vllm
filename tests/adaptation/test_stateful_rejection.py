@@ -56,3 +56,19 @@ class TestStatefulRejection:
         adapter = _adapter_with(_StatefulMixer())
         with pytest.raises(ValueError, match="stateful"):
             _prepare_adapter(adapter, torch.device("cpu"), torch.float32)
+
+    def test_composite_member_with_stateful_mixer_rejected(self):
+        # Wrapping a rejected mechanism inside a composite must not
+        # smuggle it past the capability check.
+        composite = nn.Module()
+        composite.members = nn.ModuleList(
+            [_adapter_with(_PlainMixer()),
+             _adapter_with(_StatefulMixer())])
+        with pytest.raises(ValueError, match="stateful"):
+            check_adaptation_supported(composite)
+
+    def test_composite_with_supported_members_accepted(self):
+        composite = nn.Module()
+        composite.members = nn.ModuleList(
+            [_adapter_with(_PlainMixer()), _adapter_with(None)])
+        check_adaptation_supported(composite)

@@ -97,7 +97,14 @@ def check_adaptation_supported(adaptation: nn.Module) -> None:
     that need separate k/v streams (``needs_kv``) require per-request
     state that does not survive vLLM's batching, reordering, and
     preemption — loading them would corrupt generations silently.
+
+    Composites (``adaptation.members``) are checked member by member:
+    a rejected mechanism does not become servable by being wrapped.
     """
+    members = getattr(adaptation, "members", None)
+    if members is not None:
+        for member in members:
+            check_adaptation_supported(member)
     mixer = getattr(adaptation, "mixer", None)
     if mixer is None:
         return
