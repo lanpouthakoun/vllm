@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Training-time ReFT weight sync for multiple adapters.
+"""Training-time adapter weight sync for multiple adapters.
 
-Exercises WorkerBase.sync_reft_weights / refresh_reft_caches against
-dummy decoder layers, covering the two-adapter (prefill + decode pair)
-training loop: each adapter is synced by its own reft_int_id and only
-that adapter's weights/caches may change.
+Exercises WorkerBase.sync_adapter_weights / refresh_adapter_caches
+against dummy decoder layers, covering the two-adapter (prefill +
+decode pair) training loop: each adapter is synced by its own
+adapter_int_id and only that adapter's weights/caches may change.
 """
 
 from types import SimpleNamespace
@@ -14,7 +14,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm.adaptation.layer import _add_adapter_to_layer, _init_multi_reft_state
+from vllm.adaptation.layer import (_add_adapter_to_layer,
+                                   _init_multi_adapter_state)
 from vllm.worker.worker_base import WorkerBase
 
 HIDDEN = 4
@@ -31,15 +32,15 @@ class TrackingAdapter(nn.Module):
     def install_inference_caches(self, model_dtype=torch.float32):
         self.cache_installs += 1
 
-    def _compute_delta(self, h):
-        return self.proj(h)
+    def readout(self, fx, state=None, x=None):
+        return fx + self.proj(fx)
 
 
 def _make_model(num_layers: int = 2, adapter_ids=(1, 2)):
     layers = []
     for _ in range(num_layers):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         for adapter_id in adapter_ids:
             position = "decode" if adapter_id % 2 == 0 else "prefill"
             _add_adapter_to_layer(layer, adapter_id, TrackingAdapter(),
@@ -51,9 +52,9 @@ def _make_model(num_layers: int = 2, adapter_ids=(1, 2)):
 
 def _fake_worker(model) -> SimpleNamespace:
     worker = SimpleNamespace(get_model=lambda: model)
-    worker.refresh_reft_caches = (
-        lambda reft_int_id=None: WorkerBase.refresh_reft_caches(
-            worker, reft_int_id))
+    worker.refresh_adapter_caches = (
+        lambda adapter_int_id=None: WorkerBase.refresh_adapter_caches(
+            worker, adapter_int_id))
     return worker
 
 
@@ -65,7 +66,7 @@ def _state_dict(fill: float) -> dict[str, torch.Tensor]:
 
 
 def _adapter(layer, adapter_id: int) -> TrackingAdapter:
-    return layer.reft_adapters[str(adapter_id)]
+    return layer.served_adapters[str(adapter_id)]
 
 
 class TestSyncPinsAgainstEviction:
@@ -73,81 +74,84 @@ class TestSyncPinsAgainstEviction:
     modules; LRU eviction would rebuild it from its stale blueprint and
     silently revert training.  Syncing must pin the adapter."""
 
-    def _manager_setup(self, monkeypatch, max_refts):
-        import vllm.adaptation.specs as vllm_reft
-        from vllm.adaptation.manager import ReFTModel, ReFTModelManager
+    def _manager_setup(self, monkeypatch, max_adapters):
+        import vllm.adaptation.specs as vllm_specs
+        from vllm.adaptation.manager import ServedAdapter, AdapterManager
         monkeypatch.setattr(
-            vllm_reft, "reft_config_to_spec", lambda cfg: {
+            vllm_specs, "adapter_config_to_spec", lambda cfg: {
                 "layer_indices": [0],
                 "sample_adapter": TrackingAdapter(),
                 "position": "prefill",
             })
         layer = nn.Module()
-        layer._reft_layer_idx = 0
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
-        manager = ReFTModelManager([layer], max_refts=max_refts,
-                                   max_cpu_refts=8,
-                                   device=torch.device("cpu"),
-                                   model_dtype=torch.float32)
+        layer._adapter_layer_idx = 0
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
+        manager = AdapterManager([layer], max_adapters=max_adapters,
+                                 max_cpu_adapters=8,
+                                 device=torch.device("cpu"),
+                                 model_dtype=torch.float32)
         model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
         worker = SimpleNamespace(get_model=lambda: model,
-                                 _get_reft_manager=lambda: manager)
-        worker.refresh_reft_caches = (
-            lambda reft_int_id=None: WorkerBase.refresh_reft_caches(
-                worker, reft_int_id))
+                                 _get_adapter_manager=lambda: manager)
+        worker.refresh_adapter_caches = (
+            lambda adapter_int_id=None: WorkerBase.refresh_adapter_caches(
+                worker, adapter_int_id))
 
         def add(rid):
             manager.add_adapter(
-                ReFTModel(id=rid, position="prefill", adapter_config={},
-                          layer_indices=frozenset([0])))
+                ServedAdapter(id=rid, position="prefill", adapter_config={},
+                              layer_indices=frozenset([0])))
             manager.activate_adapter(rid)
 
         return manager, worker, layer, add
 
     def test_synced_adapter_survives_lru_eviction(self, monkeypatch):
         manager, worker, layer, add = self._manager_setup(monkeypatch,
-                                                          max_refts=2)
+                                                          max_adapters=2)
         add(1)
         add(2)
-        WorkerBase.sync_reft_weights(worker, {0: _state_dict(0.5)},
-                                     refresh_caches=False, reft_int_id=1)
-        synced_weight = layer.reft_adapters["1"].proj.weight.clone()
+        WorkerBase.sync_adapter_weights(worker, {0: _state_dict(0.5)},
+                                        refresh_caches=False,
+                                        adapter_int_id=1)
+        synced_weight = layer.served_adapters["1"].proj.weight.clone()
 
         # Slot pressure: id 3 must evict id 2, never the pinned id 1.
         add(3)
         assert manager.is_active(1)
         assert not manager.is_active(2)
-        assert torch.equal(layer.reft_adapters["1"].proj.weight,
+        assert torch.equal(layer.served_adapters["1"].proj.weight,
                            synced_weight)
 
     def test_eviction_raises_when_only_pinned_left(self, monkeypatch):
         manager, worker, layer, add = self._manager_setup(monkeypatch,
-                                                          max_refts=1)
+                                                          max_adapters=1)
         add(1)
-        WorkerBase.sync_reft_weights(worker, {0: _state_dict(0.5)},
-                                     refresh_caches=False, reft_int_id=1)
+        WorkerBase.sync_adapter_weights(worker, {0: _state_dict(0.5)},
+                                        refresh_caches=False,
+                                        adapter_int_id=1)
         with pytest.raises(RuntimeError):
             add(2)
 
     def test_pin_unregistered_raises(self, monkeypatch):
-        manager, _, _, _ = self._manager_setup(monkeypatch, max_refts=2)
+        manager, _, _, _ = self._manager_setup(monkeypatch, max_adapters=2)
         with pytest.raises(ValueError, match="not registered"):
             manager.pin_adapter(99)
 
     def test_sync_without_manager_registration_is_fine(self, monkeypatch):
-        # Construction-baked adapters (reft_config=) are not in the
+        # Construction-baked adapters (adapter_config=) are not in the
         # manager; syncing them must not fail on the pin step.
         manager, worker, layer, _ = self._manager_setup(monkeypatch,
-                                                        max_refts=2)
+                                                        max_adapters=2)
         _add_adapter_to_layer(layer, 7, TrackingAdapter(), "prefill",
                               torch.device("cpu"))
-        count = WorkerBase.sync_reft_weights(worker, {0: _state_dict(0.25)},
-                                             refresh_caches=False,
-                                             reft_int_id=7)
+        count = WorkerBase.sync_adapter_weights(worker,
+                                                {0: _state_dict(0.25)},
+                                                refresh_caches=False,
+                                                adapter_int_id=7)
         assert count == 1
 
 
-class TestSyncReftWeights:
+class TestSyncAdapterWeights:
 
     def test_sync_updates_only_target_adapter(self):
         model, layers = _make_model()
@@ -156,11 +160,11 @@ class TestSyncReftWeights:
             _adapter(layer, 1).proj.weight.clone() for layer in layers
         ]
 
-        count = WorkerBase.sync_reft_weights(worker,
-                                             {0: _state_dict(0.25),
-                                              1: _state_dict(0.25)},
-                                             refresh_caches=False,
-                                             reft_int_id=2)
+        count = WorkerBase.sync_adapter_weights(worker,
+                                                {0: _state_dict(0.25),
+                                                 1: _state_dict(0.25)},
+                                                refresh_caches=False,
+                                                adapter_int_id=2)
         assert count == 2
         for layer, before in zip(layers, before_a1):
             assert torch.all(_adapter(layer, 2).proj.weight == 0.25)
@@ -170,16 +174,16 @@ class TestSyncReftWeights:
         model, layers = _make_model()
         worker = _fake_worker(model)
 
-        assert WorkerBase.sync_reft_weights(worker,
-                                            {0: _state_dict(0.5),
-                                             1: _state_dict(0.5)},
-                                            refresh_caches=False,
-                                            reft_int_id=1) == 2
-        assert WorkerBase.sync_reft_weights(worker,
-                                            {0: _state_dict(0.25),
-                                             1: _state_dict(0.25)},
-                                            refresh_caches=False,
-                                            reft_int_id=2) == 2
+        assert WorkerBase.sync_adapter_weights(worker,
+                                               {0: _state_dict(0.5),
+                                                1: _state_dict(0.5)},
+                                               refresh_caches=False,
+                                               adapter_int_id=1) == 2
+        assert WorkerBase.sync_adapter_weights(worker,
+                                               {0: _state_dict(0.25),
+                                                1: _state_dict(0.25)},
+                                               refresh_caches=False,
+                                               adapter_int_id=2) == 2
         for layer in layers:
             assert torch.all(_adapter(layer, 1).proj.weight == 0.5)
             assert torch.all(_adapter(layer, 2).proj.weight == 0.25)
@@ -187,9 +191,10 @@ class TestSyncReftWeights:
     def test_sync_subset_of_layers(self):
         model, layers = _make_model()
         worker = _fake_worker(model)
-        count = WorkerBase.sync_reft_weights(worker, {1: _state_dict(0.75)},
-                                             refresh_caches=False,
-                                             reft_int_id=1)
+        count = WorkerBase.sync_adapter_weights(worker,
+                                                {1: _state_dict(0.75)},
+                                                refresh_caches=False,
+                                                adapter_int_id=1)
         assert count == 1
         assert not torch.all(_adapter(layers[0], 1).proj.weight == 0.75)
         assert torch.all(_adapter(layers[1], 1).proj.weight == 0.75)
@@ -197,20 +202,21 @@ class TestSyncReftWeights:
     def test_sync_missing_adapter_id_is_noop(self):
         model, layers = _make_model(adapter_ids=(1, ))
         worker = _fake_worker(model)
-        count = WorkerBase.sync_reft_weights(worker, {0: _state_dict(0.9)},
-                                             refresh_caches=True,
-                                             reft_int_id=7)
+        count = WorkerBase.sync_adapter_weights(worker,
+                                                {0: _state_dict(0.9)},
+                                                refresh_caches=True,
+                                                adapter_int_id=7)
         assert count == 0
         assert _adapter(layers[0], 1).cache_installs == 0
 
     def test_refresh_caches_only_for_synced_id(self):
         model, layers = _make_model()
         worker = _fake_worker(model)
-        WorkerBase.sync_reft_weights(worker,
-                                     {0: _state_dict(0.1),
-                                      1: _state_dict(0.1)},
-                                     refresh_caches=True,
-                                     reft_int_id=2)
+        WorkerBase.sync_adapter_weights(worker,
+                                        {0: _state_dict(0.1),
+                                         1: _state_dict(0.1)},
+                                        refresh_caches=True,
+                                        adapter_int_id=2)
         for layer in layers:
             assert _adapter(layer, 2).cache_installs == 1
             assert _adapter(layer, 1).cache_installs == 0
@@ -218,7 +224,7 @@ class TestSyncReftWeights:
     def test_refresh_all_caches(self):
         model, layers = _make_model()
         worker = _fake_worker(model)
-        WorkerBase.refresh_reft_caches(worker)
+        WorkerBase.refresh_adapter_caches(worker)
         for layer in layers:
             assert _adapter(layer, 1).cache_installs == 1
             assert _adapter(layer, 2).cache_installs == 1
@@ -230,16 +236,16 @@ class TestSyncReftWeights:
         for step in range(3):
             prefill_fill = 0.1 * (step + 1)
             decode_fill = 0.01 * (step + 1)
-            WorkerBase.sync_reft_weights(worker,
-                                         {0: _state_dict(prefill_fill),
-                                          1: _state_dict(prefill_fill)},
-                                         refresh_caches=True,
-                                         reft_int_id=1)
-            WorkerBase.sync_reft_weights(worker,
-                                         {0: _state_dict(decode_fill),
-                                          1: _state_dict(decode_fill)},
-                                         refresh_caches=True,
-                                         reft_int_id=2)
+            WorkerBase.sync_adapter_weights(worker,
+                                            {0: _state_dict(prefill_fill),
+                                             1: _state_dict(prefill_fill)},
+                                            refresh_caches=True,
+                                            adapter_int_id=1)
+            WorkerBase.sync_adapter_weights(worker,
+                                            {0: _state_dict(decode_fill),
+                                             1: _state_dict(decode_fill)},
+                                            refresh_caches=True,
+                                            adapter_int_id=2)
         for layer in layers:
             assert torch.allclose(_adapter(layer, 1).proj.weight,
                                   torch.full((HIDDEN, HIDDEN), 0.3))

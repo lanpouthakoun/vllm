@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the ReFT "decode" position mask.
+"""Tests for the adapter "decode" position mask.
 
 The "decode" position is the exact complement of "prefill": in a v1
 batch (decode tokens first, prefill tokens last) it selects the decode
@@ -15,9 +15,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm.adaptation.layer import (_add_adapter_to_layer, _compute_position_mask,
-                             _init_multi_reft_state, _multi_reft_forward,
-                             update_multi_reft_position_masks)
+from vllm.adaptation.layer import (_add_adapter_to_layer,
+                                   _compute_position_mask,
+                                   _init_multi_adapter_state,
+                                   _multi_adapter_forward,
+                                   update_adapter_position_masks)
 
 HIDDEN = 8
 
@@ -84,24 +86,25 @@ class TestDecodePositionMask:
 
 
 class ConstAdapter(nn.Module):
-    """Adapter returning a constant delta; has params for device probing."""
+    """Adapter returning a constant correction; has params for device
+    probing."""
 
     def __init__(self, value: float):
         super().__init__()
         self.value = value
         self.marker = nn.Linear(1, 1)
 
-    def _compute_delta(self, h):
-        return torch.full_like(h, self.value)
+    def readout(self, fx, state=None, x=None):
+        return fx + torch.full_like(fx, self.value)
 
 
 def _make_layer() -> nn.Module:
     layer = nn.Module()
-    _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+    _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
     return layer
 
 
-class TestMultiReftMaskUpdate:
+class TestMultiAdapterMaskUpdate:
 
     def test_pure_decode_skips_prefill_only_adapters(self):
         layer = _make_layer()
@@ -109,9 +112,9 @@ class TestMultiReftMaskUpdate:
                               torch.device("cpu"))
         token_ids = torch.tensor([1, 1, 1], dtype=torch.int32)
         positions = torch.tensor([5, 9, 3])
-        update_multi_reft_position_masks([layer], token_ids, positions,
-                                         _meta(0, 3, 0), 3)
-        assert layer._reft_all_masks_zero
+        update_adapter_position_masks([layer], token_ids, positions,
+                                      _meta(0, 3, 0), 3)
+        assert layer._adapter_all_masks_zero
 
     def test_pure_decode_does_not_skip_decode_adapters(self):
         layer = _make_layer()
@@ -119,11 +122,11 @@ class TestMultiReftMaskUpdate:
                               torch.device("cpu"))
         token_ids = torch.tensor([2, 2, 2], dtype=torch.int32)
         positions = torch.tensor([5, 9, 3])
-        update_multi_reft_position_masks([layer], token_ids, positions,
-                                         _meta(0, 3, 0), 3)
-        assert not layer._reft_all_masks_zero
-        assert 2 in layer._reft_active_ids
-        assert layer._reft_combined_masks[2][:3].tolist() == [1, 1, 1]
+        update_adapter_position_masks([layer], token_ids, positions,
+                                      _meta(0, 3, 0), 3)
+        assert not layer._adapter_all_masks_zero
+        assert 2 in layer._adapter_active_ids
+        assert layer._adapter_combined_masks[2][:3].tolist() == [1, 1, 1]
 
     def test_mixed_batch_membership_and_position_combine(self):
         layer = _make_layer()
@@ -135,11 +138,11 @@ class TestMultiReftMaskUpdate:
         # Req A uses adapter 2 (decode); req B uses adapter 1 (prefill).
         token_ids = torch.tensor([2, 2, 1, 1, 1, 1], dtype=torch.int32)
         positions = torch.tensor([8, 4, 0, 1, 2, 3])
-        update_multi_reft_position_masks([layer], token_ids, positions,
-                                         _meta(4, 2, 1), 6)
-        assert layer._reft_combined_masks[1][:6].tolist() == \
+        update_adapter_position_masks([layer], token_ids, positions,
+                                      _meta(4, 2, 1), 6)
+        assert layer._adapter_combined_masks[1][:6].tolist() == \
             [0, 0, 1, 1, 1, 1]
-        assert layer._reft_combined_masks[2][:6].tolist() == \
+        assert layer._adapter_combined_masks[2][:6].tolist() == \
             [1, 1, 0, 0, 0, 0]
 
     def test_decode_adapter_excluded_from_final_prefill_chunk(self):
@@ -150,12 +153,12 @@ class TestMultiReftMaskUpdate:
                               torch.device("cpu"))
         token_ids = torch.tensor([2, 2, 2, 2], dtype=torch.int32)
         positions = torch.tensor([0, 1, 2, 3])  # pure prefill chunk
-        update_multi_reft_position_masks([layer], token_ids, positions,
-                                         _meta(4, 0, 1), 4)
-        assert layer._reft_combined_masks[2][:4].tolist() == [0, 0, 0, 0]
+        update_adapter_position_masks([layer], token_ids, positions,
+                                      _meta(4, 0, 1), 4)
+        assert layer._adapter_combined_masks[2][:4].tolist() == [0, 0, 0, 0]
 
 
-class TestMultiReftForward:
+class TestMultiAdapterForward:
 
     def _run_forward(self, layer, num_tokens):
         hidden = torch.ones(num_tokens, HIDDEN)
@@ -165,8 +168,8 @@ class TestMultiReftForward:
         def super_forward(positions, hidden_states, residual):
             return hidden_states, residual
 
-        return _multi_reft_forward(layer, positions, hidden, residual,
-                                   super_forward=super_forward)
+        return _multi_adapter_forward(layer, positions, hidden, residual,
+                                      super_forward=super_forward)
 
     def test_paired_adapters_apply_in_their_own_regions(self):
         layer = _make_layer()
@@ -177,8 +180,8 @@ class TestMultiReftForward:
         # 2 decode tokens (adapter 2), 3 prefill tokens (adapter 1).
         token_ids = torch.tensor([2, 2, 1, 1, 1], dtype=torch.int32)
         positions = torch.tensor([9, 5, 0, 1, 2])
-        update_multi_reft_position_masks([layer], token_ids, positions,
-                                         _meta(3, 2, 1), 5)
+        update_adapter_position_masks([layer], token_ids, positions,
+                                      _meta(3, 2, 1), 5)
 
         hidden_out, residual_out = self._run_forward(layer, 5)
         # h_full = hidden + residual = 2.0; output hidden = masked delta.
@@ -194,8 +197,8 @@ class TestMultiReftForward:
                               torch.device("cpu"))
         token_ids = torch.tensor([1, 1], dtype=torch.int32)
         positions = torch.tensor([9, 5])
-        update_multi_reft_position_masks([layer], token_ids, positions,
-                                         _meta(0, 2, 0), 2)
+        update_adapter_position_masks([layer], token_ids, positions,
+                                      _meta(0, 2, 0), 2)
         hidden_out, residual_out = self._run_forward(layer, 2)
         # Skipped entirely: layer output passes through unchanged.
         assert torch.allclose(hidden_out, torch.ones(2, HIDDEN))
