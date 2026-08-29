@@ -453,21 +453,18 @@ def _blueprint_to_adapter(blueprint: dict):
 def _write_spec_file(spec: dict) -> None:
     """Serialise *spec* to a temp file and record the path in the environment.
 
-    The sample_adapter is replaced with a plain blueprint dict (constructor
-    kwargs) before saving.  See ``_adapter_to_blueprint`` for why this is
-    preferable to de-parametrizing the adapter module.
+    Delegates to :func:`spec_to_adapter_config` — the SAME serializer the
+    ``VllmConfig.adapter_config`` (fork-mode) path uses — so spawned
+    workers reading the file deserialize exactly what fork-mode workers
+    receive.  In particular, shared-view adapters (one shared core plus
+    per-layer embeddings) carry their ``layer_emb`` through
+    ``adapter_states``; the old raw ``state_dict()`` save dropped the
+    non-persistent buffer and every layer came back stamped with the
+    sample's embedding.
     """
     import torch
 
-    saveable_spec = dict(spec)
-    adapter = saveable_spec.get("sample_adapter")
-    if adapter is not None:
-        saveable_spec["sample_adapter"] = _adapter_to_blueprint(adapter)
-    adapters = saveable_spec.pop("adapters", None)
-    if adapters is not None:
-        saveable_spec["adapter_states"] = {
-            idx: a.state_dict() for idx, a in adapters.items()
-        }
+    saveable_spec = spec_to_adapter_config(spec)
 
     fd, path = tempfile.mkstemp(suffix=".pt", prefix="vllm_adapter_spec_")
     os.close(fd)
@@ -485,8 +482,11 @@ def _write_spec_file(spec: dict) -> None:
 def _read_spec_file() -> Optional[dict]:
     """Load and return the spec from the temp file, or ``None``.
 
-    If the spec was written by a newer version that stores a blueprint dict
-    instead of a module, the adapter is reconstructed before returning.
+    Delegates to :func:`adapter_config_to_spec` — the same deserializer
+    the ``VllmConfig.adapter_config`` path uses — so spawn-mode workers
+    reconstruct adapters identically to fork-mode workers (both
+    ``AdapterBlueprint`` and ``SharedViewBlueprint`` samples, and the
+    shared-core rebuild for per-layer ``adapter_states``).
     """
     import torch
 
@@ -498,41 +498,18 @@ def _read_spec_file() -> Optional[dict]:
     except Exception:
         return None
 
-    # Reconstruct adapter from blueprint if this is a new-style spec file.
-    adapter = spec.get("sample_adapter")
-    if isinstance(adapter, dict) and adapter.get("__type__") == "AdapterBlueprint":
-        try:
-            spec["sample_adapter"] = _blueprint_to_adapter(adapter)
-        except Exception as e:
-            logger.error(
-                "Failed to reconstruct adapter from blueprint: %s. "
-                "module=%s qualname=%s kwargs_keys=%s",
-                e, adapter.get('__module__'), adapter.get('__qualname__'),
-                sorted(adapter.get('kwargs', {}).keys()),
-            )
-            return None
-        else:
-            rebuilt = spec["sample_adapter"]
-            logger.debug(
-                "Blueprint reconstructed OK: %s | state_keys=%s",
-                type(rebuilt).__name__, sorted(rebuilt.state_dict().keys()),
-            )
-
-    # Reconstruct per-layer adapters from saved state dicts.
-    adapter_states = spec.pop("adapter_states", None)
-    sample = spec.get("sample_adapter")
-    if adapter_states is not None and sample is not None:
-        import copy
-        adapters = {}
-        for idx, sd in adapter_states.items():
-            a = copy.deepcopy(sample)
-            a.load_state_dict(_deserialize_state_dict(sd), strict=False)
-            if hasattr(a, "install_inference_caches"):
-                a.install_inference_caches()
-            adapters[int(idx)] = a
-        spec["adapters"] = adapters
-
-    return spec
+    try:
+        return adapter_config_to_spec(spec)
+    except Exception as e:
+        adapter = spec.get("sample_adapter") if isinstance(spec, dict) else None
+        logger.error(
+            "Failed to reconstruct adapter spec from %s: %s. "
+            "sample_adapter type=%s",
+            path, e,
+            adapter.get("__type__") if isinstance(adapter, dict)
+            else type(adapter).__name__,
+        )
+        return None
 
 
 def _remove_spec_file() -> None:
