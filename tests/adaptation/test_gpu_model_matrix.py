@@ -19,12 +19,15 @@ from tests.adaptation.test_gpu_e2e import (BigDeltaAdapter,  # noqa: E402
 
 # Architectures beyond Qwen2: qwen3 (new hook), llama3 (existing hook on
 # a real Llama), phi3 (inherits the llama hook via subclassing), gemma2
-# (new hook; gated on HF — skipped when inaccessible).
+# (new hook; gated on HF — skipped when inaccessible), olmo2 (residual-
+# free forward contract; also serves Olmo3ForCausalLM via registry
+# alias — skipped when not downloadable).
 MODEL_MATRIX = [
     "Qwen/Qwen3-0.6B",
     "meta-llama/Llama-3.2-1B-Instruct",
     "microsoft/Phi-3-mini-4k-instruct",
     "google/gemma-2-2b-it",
+    "allenai/OLMo-2-0425-1B",
 ]
 
 

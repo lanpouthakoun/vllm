@@ -6,8 +6,10 @@
 layer class following vLLM's conventions — constructor args are passed
 through verbatim, the forward contract is
 ``(positions, hidden_states, residual, **kwargs) -> (hidden, residual)``
-— and installs the multi-adapter runtime on it.  The per-architecture
-factories (qwen2/llama/qwen3moe) become thin wrappers, and new
+or the residual-free ``(positions, hidden_states) -> hidden`` used by
+norm-after-block architectures (olmo2/olmo3) — and installs the
+multi-adapter runtime on it.  The per-architecture factories
+(qwen2/llama/qwen3moe/olmo2) become thin wrappers, and new
 architectures (qwen3, gemma2, gemma3, ...) hook in with one line via
 ``maybe_adapter_layer_type``.
 """
@@ -80,6 +82,20 @@ class KwargsForwardLayer(LegacyStyleLayer):
     def forward(self, positions, hidden_states, residual, **kwargs):
         self.seen_kwargs.append(dict(kwargs))
         return super().forward(positions, hidden_states, residual)
+
+
+class PlainStreamLayer(nn.Module):
+    """Residual-free forward ``(positions, hidden_states) -> hidden`` —
+    olmo2/olmo3 style (norms applied to block outputs, no deferred
+    residual add).  Adds +1 so pass-through bugs are visible."""
+
+    def __init__(self, *, vllm_config, prefix: str = ""):
+        super().__init__()
+        self.hidden_size = vllm_config.model_config.hf_config.hidden_size
+        self.lin = nn.Linear(2, 2)
+
+    def forward(self, positions, hidden_states):
+        return hidden_states + 1.0
 
 
 class ConstAdapter(nn.Module):
@@ -167,6 +183,74 @@ class TestGenericFactory:
         assert issubclass(cls, LegacyStyleLayer)
 
 
+class TestPlainStreamContract:
+    """Residual-free (olmo2-style) layers run the same multi-adapter
+    path; only the calling convention is adapted."""
+
+    def _make_layer(self, spec=None, prefix="model.layers.0"):
+        cls = make_adapter_decoder_layer(PlainStreamLayer, spec)
+        vllm_config = SimpleNamespace(model_config=SimpleNamespace(
+            hf_config=_Cfg()))
+        return cls(vllm_config=vllm_config, prefix=prefix)
+
+    def test_wraps_and_installs_state(self):
+        layer = self._make_layer(prefix="model.layers.11")
+        assert layer._adapter_layer_idx == 11
+        assert hasattr(layer, "served_adapters")
+        assert len(layer.served_adapters) == 0
+
+    def test_no_adapter_passthrough_is_identical(self):
+        # Zero mounted adapters must reproduce the base forward exactly
+        # (the zeroinit/base bit-identity contract at the layer level).
+        layer = self._make_layer()
+        positions = torch.arange(4)
+        x = torch.randn(4, HIDDEN)
+        out = layer(positions, x)
+        assert torch.equal(out, x + 1.0)
+
+    def test_dynamic_adapter_applies_to_stream(self):
+        layer = self._make_layer()
+        _add_adapter_to_layer(layer, 1, ConstAdapter(0.5), "all",
+                              torch.device("cpu"))
+        token_ids = torch.ones(4, dtype=torch.int32)
+        positions = torch.arange(4)
+        update_adapter_position_masks([layer], token_ids, positions,
+                                         _meta(4, 0, 1), 4)
+        out = layer(positions, torch.ones(4, HIDDEN))
+        # stream = base_forward(1) + adapter delta = (1+1) + 0.5
+        assert torch.allclose(out, torch.full((4, HIDDEN), 2.5))
+
+    def test_baked_spec_installs_adapter_id_1(self):
+        spec = {
+            "layer_indices": [2],
+            "position": "prefill",
+            "sample_adapter": ConstAdapter(0.25),
+        }
+        cls = make_adapter_decoder_layer(PlainStreamLayer, spec)
+        vllm_config = SimpleNamespace(model_config=SimpleNamespace(
+            hf_config=_Cfg()))
+        in_scope = cls(vllm_config=vllm_config, prefix="model.layers.2")
+        out_of_scope = cls(vllm_config=vllm_config, prefix="model.layers.4")
+        assert "1" in in_scope.served_adapters
+        assert len(out_of_scope.served_adapters) == 0
+        token_ids = torch.ones(4, dtype=torch.int32)
+        positions = torch.arange(4)
+        update_adapter_position_masks([in_scope], token_ids, positions,
+                                         _meta(4, 0, 1), 4)
+        out = in_scope(positions, torch.ones(4, HIDDEN))
+        assert torch.allclose(out, torch.full((4, HIDDEN), 2.25))
+
+    def test_maybe_adapter_layer_type_wraps_plain_contract(self):
+        vllm_config = SimpleNamespace(enable_adapters=True,
+                                      adapter_config=None,
+                                      model_config=SimpleNamespace(
+                                          hf_config=_Cfg()))
+        cls = maybe_adapter_layer_type(vllm_config, PlainStreamLayer,
+                                    arch="olmo2")
+        assert cls is not PlainStreamLayer
+        assert issubclass(cls, PlainStreamLayer)
+
+
 class TestMaybeAdapterLayerType:
 
     def _vllm_config(self, enable_adapters, adapter_config=None):
@@ -196,6 +280,8 @@ class TestBackwardCompatFactories:
          "vllm.model_executor.models.llama.LlamaDecoderLayer"),
         ("make_adapter_qwen3_moe_layer",
          "vllm.model_executor.models.qwen3_moe.Qwen3MoeDecoderLayer"),
+        ("make_adapter_olmo2_layer",
+         "vllm.model_executor.models.olmo2.Olmo2DecoderLayer"),
     ])
     def test_wrappers_subclass_their_base(self, factory_name, base_path):
         import importlib

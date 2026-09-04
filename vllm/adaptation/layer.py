@@ -35,6 +35,7 @@ the correct device after .to() calls.
 """
 
 import copy
+import inspect
 import logging
 import math
 import os
@@ -1052,7 +1053,11 @@ def _multi_adapter_forward(
     if skip:
         return hidden_states, residual
 
-    h_full = hidden_states + residual
+    # Residual-free layers (e.g. olmo2's norm-after-block ordering) hand
+    # back the full stream directly with residual=None; llama-style
+    # layers defer the add to (hidden, residual).  Either way h_full is
+    # the value of the residual stream leaving the block.
+    h_full = hidden_states if residual is None else hidden_states + residual
     new_stream = h_full
 
     # Sequentially blend each active block_output adaptation into the
@@ -1071,6 +1076,9 @@ def _multi_adapter_forward(
         new_stream = _blend_one_adaptation(layer_self, int_id, adapter,
                                            new_stream)
 
+    if residual is None:
+        # Residual-free contract: the adapted stream is the output.
+        return new_stream, None
     hidden_states = new_stream - h_full
     residual = h_full
     return hidden_states, residual
@@ -1322,7 +1330,12 @@ def make_adapter_decoder_layer(base_layer_cls: type,
         and the modern ``(vllm_config, prefix)`` style),
       - forward contract ``(positions, hidden_states, residual,
         **kwargs) -> (hidden_states, residual)`` (extra kwargs, e.g.
-        gemma3's, are forwarded).
+        gemma3's, are forwarded), OR the residual-free contract
+        ``(positions, hidden_states, **kwargs) -> hidden_states`` used
+        by norm-after-block architectures (olmo2/olmo3), detected from
+        the base class's forward signature.  Both contracts run the
+        same ``_multi_adapter_forward`` path; only the calling
+        convention is adapted.
 
     If *adapter_spec* is provided (single-adapter backward compat), the
     initial adapter is installed at construction with ``adapter_int_id=1``
@@ -1343,6 +1356,16 @@ def make_adapter_decoder_layer(base_layer_cls: type,
         debug_mask_enabled = False
 
     arch_name = arch or base_layer_cls.__name__
+
+    # Detect the base layer's forward contract from its signature:
+    # llama-style takes an explicit ``residual`` argument and returns a
+    # (hidden, residual) pair; olmo2-style takes none and returns the
+    # full stream directly.
+    try:
+        _has_residual_arg = "residual" in inspect.signature(
+            base_layer_cls.forward).parameters
+    except (TypeError, ValueError):
+        _has_residual_arg = True
 
     def _find_prefix(args, kwargs) -> str:
         prefix = kwargs.get("prefix")
@@ -1430,19 +1453,36 @@ def make_adapter_decoder_layer(base_layer_cls: type,
                 adapter=getattr(self, "adapter_adapter", None),
             )
 
-        def forward(self, positions, hidden_states, residual, **kwargs):
-            if kwargs:
+        if _has_residual_arg:
+
+            def forward(self, positions, hidden_states, residual, **kwargs):
+                if kwargs:
+
+                    def super_forward(p, h, r):
+                        return base_layer_cls.forward(self, p, h, r, **kwargs)
+                else:
+
+                    def super_forward(p, h, r):
+                        return base_layer_cls.forward(self, p, h, r)
+
+                return _multi_adapter_forward(self, positions, hidden_states,
+                                           residual,
+                                           super_forward=super_forward)
+        else:
+
+            def forward(self, positions, hidden_states, **kwargs):
+                # Residual-free contract (olmo2-style): the base forward
+                # returns the full stream; thread it through the shared
+                # multi-adapter path with residual=None on both sides.
 
                 def super_forward(p, h, r):
-                    return base_layer_cls.forward(self, p, h, r, **kwargs)
-            else:
+                    del r  # base layer carries the stream in h alone
+                    return base_layer_cls.forward(self, p, h, **kwargs), None
 
-                def super_forward(p, h, r):
-                    return base_layer_cls.forward(self, p, h, r)
-
-            return _multi_adapter_forward(self, positions, hidden_states,
-                                       residual,
-                                       super_forward=super_forward)
+                out, _ = _multi_adapter_forward(self, positions, hidden_states,
+                                             None,
+                                             super_forward=super_forward)
+                return out
 
         def get_adapter_debug_stats(self) -> Optional[dict]:
             return _collect_layer_adapter_debug_stats(self)
@@ -1538,3 +1578,11 @@ def make_adapter_qwen3_moe_layer(adapter_spec: Optional[dict] = None) -> type:
     from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
     return make_adapter_decoder_layer(Qwen3MoeDecoderLayer, adapter_spec,
                                    arch="qwen3_moe")
+
+
+def make_adapter_olmo2_layer(adapter_spec: Optional[dict] = None) -> type:
+    """Olmo2DecoderLayer serves both Olmo2ForCausalLM and Olmo3ForCausalLM
+    (the registry aliases Olmo3 to olmo2.py)."""
+    from vllm.model_executor.models.olmo2 import Olmo2DecoderLayer
+    return make_adapter_decoder_layer(Olmo2DecoderLayer, adapter_spec,
+                                   arch="olmo2")

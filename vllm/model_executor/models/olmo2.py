@@ -281,10 +281,18 @@ class Olmo2Model(nn.Module):
             self.config.hidden_size,
             prefix=f"{prefix}.embed_tokens",
         )
+        # Adapter hook: same code path as llama/qwen2 — resolves to an
+        # adapter-aware subclass of Olmo2DecoderLayer when adapter_config
+        # is set (baked adapter) or enable_adapters is on (dynamic
+        # loading), and to Olmo2DecoderLayer itself otherwise.  Covers
+        # both Olmo2ForCausalLM and Olmo3ForCausalLM (registry alias).
+        from vllm.adaptation.layer import maybe_adapter_layer_type
+        layer_cls = maybe_adapter_layer_type(vllm_config, Olmo2DecoderLayer,
+                                          arch="olmo2")
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_hidden_layers,
-            lambda prefix: Olmo2DecoderLayer(vllm_config=vllm_config,
-                                             prefix=prefix),
+            lambda prefix: layer_cls(vllm_config=vllm_config,
+                                     prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(
@@ -407,6 +415,27 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+
+    def get_adapter_debug_stats(self) -> dict:
+        """Return serializable per-layer adapter debug stats, if enabled."""
+        stats: dict = {}
+        layers = list(self.model.layers)
+        stats["__summary__"] = {
+            "model_type": type(self).__name__,
+            "num_layers": len(layers),
+            "adapter_layers": sum(
+                hasattr(layer, "served_adapters")
+                and len(layer.served_adapters) > 0 for layer in layers),
+            "debug_enabled_layers": sum(
+                bool(getattr(layer, "_adapter_debug_enabled", False))
+                for layer in layers),
+        }
+        for layer_idx, layer in enumerate(layers):
+            if hasattr(layer, "get_adapter_debug_stats"):
+                layer_stats = layer.get_adapter_debug_stats()
+                if layer_stats is not None:
+                    stats[layer_idx] = layer_stats
+        return stats
 
     def forward(
         self,
