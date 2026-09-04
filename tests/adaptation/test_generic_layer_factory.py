@@ -109,6 +109,31 @@ class ConstAdapter(nn.Module):
         return fx + torch.full_like(fx, self.value)
 
 
+class ChunkScanAdapter(nn.Module):
+    """Sequence-mixing adapter with gated_delta-style internal chunk
+    padding: pads the token axis to a multiple of ``chunk``, computes a
+    causal per-chunk cumulative sum, truncates back to S.  Exercises the
+    non-multiple-of-chunk sequence lengths that chunked scans must
+    handle (the x43d '[8, 64] vs [8, 63]' failure shape)."""
+
+    sequence_mixing = True
+
+    def __init__(self, chunk=4, value=1.0):
+        super().__init__()
+        self.chunk = chunk
+        self.value = value
+        self.marker = nn.Linear(1, 1)
+
+    def readout(self, fx, state=None, x=None):
+        B, S, D = fx.shape
+        C = self.chunk
+        pad = (C - S % C) % C
+        h = torch.nn.functional.pad(fx, (0, 0, 0, pad))
+        n = (S + pad) // C
+        h = h.reshape(B, n, C, D).cumsum(2).reshape(B, n * C, D)
+        return fx + self.value * h[:, :S]
+
+
 def _run_forward(layer, num_tokens=4):
     token_ids = torch.ones(num_tokens, dtype=torch.int32)
     positions = torch.arange(num_tokens)
@@ -249,6 +274,81 @@ class TestPlainStreamContract:
                                     arch="olmo2")
         assert cls is not PlainStreamLayer
         assert issubclass(cls, PlainStreamLayer)
+
+    @pytest.mark.parametrize("num_tokens", [3, 5, 7, 9])
+    def test_chunked_scan_at_non_multiple_lengths(self, num_tokens):
+        """A chunked sequence-mixing member must produce the reference
+        result at sequence lengths that are NOT chunk multiples (the
+        x43d warmup failure was a chunk-64 scan at 504 tokens), through
+        the residual-free contract, in eager mode."""
+        layer = self._make_layer()
+        _add_adapter_to_layer(layer, 1, ChunkScanAdapter(chunk=4, value=1.0),
+                              "all", torch.device("cpu"))
+        token_ids = torch.ones(num_tokens, dtype=torch.int32)
+        positions = torch.arange(num_tokens)
+        update_adapter_position_masks([layer], token_ids, positions,
+                                         _meta(num_tokens, 0, 1), num_tokens)
+        x = torch.randn(num_tokens, HIDDEN)
+        out = layer(positions, x)
+        base = x + 1.0                       # PlainStreamLayer forward
+        # reference: chunked causal cumsum on the block output
+        C = 4
+        pad = (C - num_tokens % C) % C
+        h = torch.nn.functional.pad(base.unsqueeze(0), (0, 0, 0, pad))
+        n = (num_tokens + pad) // C
+        ref_corr = h.reshape(1, n, C, HIDDEN).cumsum(2) \
+            .reshape(1, n * C, HIDDEN)[0, :num_tokens]
+        assert torch.allclose(out, base + ref_corr, atol=1e-6)
+
+    def test_chunked_scan_parity_across_contracts(self):
+        """The two forward contracts blend a chunked sequence-mixing
+        member identically at a non-multiple-of-chunk length."""
+        S = 7
+        plain = self._make_layer()
+        _add_adapter_to_layer(plain, 1, ChunkScanAdapter(chunk=4, value=1.0),
+                              "all", torch.device("cpu"))
+        tuple_cls = make_adapter_decoder_layer(LegacyStyleLayer)
+        tup = tuple_cls(_Cfg(), None, None, prefix="model.layers.0")
+        _add_adapter_to_layer(tup, 1, ChunkScanAdapter(chunk=4, value=1.0),
+                              "all", torch.device("cpu"))
+        token_ids = torch.ones(S, dtype=torch.int32)
+        positions = torch.arange(S)
+        for layer in (plain, tup):
+            update_adapter_position_masks([layer], token_ids, positions,
+                                             _meta(S, 0, 1), S)
+        x = torch.randn(S, HIDDEN)
+        out_plain = plain(positions, x - 1.0)   # PlainStreamLayer adds +1
+        h, r = tup(positions, x, torch.zeros(S, HIDDEN))
+        assert torch.allclose(out_plain, h + r, atol=1e-6)
+
+
+class TestSequenceMixingEagerPolicy:
+    """Baked sequence-mixing adaptations force eager at engine-config
+    time (chunked scans are eager-only: segmentation + symbolic-shape
+    padding are incompatible with general-shape compile/CUDA graphs)."""
+
+    def _config_for(self, adapter):
+        from vllm.adaptation.specs import spec_to_adapter_config
+        return spec_to_adapter_config({
+            "layer_indices": [0],
+            "position": "all",
+            "sample_adapter": adapter,
+            "adapters": {0: adapter},
+        })
+
+    def test_sequence_mixing_config_needs_eager(self):
+        from vllm.adaptation.specs import adapter_config_needs_eager
+        cfg = self._config_for(ChunkScanAdapter(chunk=4, value=1.0))
+        assert adapter_config_needs_eager(cfg) is True
+
+    def test_elementwise_config_does_not_need_eager(self):
+        from vllm.adaptation.specs import adapter_config_needs_eager
+        cfg = self._config_for(ConstAdapter(0.5))
+        assert adapter_config_needs_eager(cfg) is False
+
+    def test_none_config_does_not_need_eager(self):
+        from vllm.adaptation.specs import adapter_config_needs_eager
+        assert adapter_config_needs_eager(None) is False
 
 
 class TestMaybeAdapterLayerType:

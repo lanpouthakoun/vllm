@@ -41,6 +41,7 @@ __all__ = [
     "AdapterManager",
     "AdapterRequest",
     "adapter_config_to_spec",
+    "adapter_config_needs_eager",
     "spec_to_adapter_config",
     # Deprecated global-state API (backward compat only):
     "set_adapter_spec",
@@ -222,6 +223,54 @@ def adapter_config_to_spec(adapter_config: Optional[dict[str, Any]],
         spec["adapters"] = adapters
 
     return spec
+
+
+def adapter_config_needs_eager(adapter_config: Optional[dict[str, Any]],
+                               ) -> bool:
+    """Whether a baked ``adapter_config`` requires eager execution.
+
+    Sequence-mixing adaptations (chunked delta-rule scans, cnn/bigram
+    mixers) are eager-only under vLLM serving, on every architecture:
+
+      * per-request segmentation is eager-only (segment counts are
+        dynamic shapes), so under CUDA graphs a mixer leaks across
+        request boundaries in the flattened batch;
+      * their chunked scans branch on symbolic sequence lengths
+        (``pad = (C - S % C) % C; if pad: ...``), which vLLM's
+        general-shape compile traces at one divisible hint size and
+        then replays at non-multiple sizes, miscompiling the reshape
+        (observed: bmm "[8, 64] vs [8, 63]" at warmup size 504 with a
+        chunk-64 gated-delta member — architecture-independent).
+
+    Called at engine-config time so the baked route can force
+    ``enforce_eager=True`` before compilation is configured.  Returns
+    False when the blueprint cannot be reconstructed (missing adapter
+    library): the existing runtime warning still fires in that case.
+    """
+    if not adapter_config:
+        return False
+    try:
+        from vllm.adaptation.protocol import needs_sequence_segmentation
+        spec = adapter_config_to_spec(adapter_config)
+        if spec is None:
+            return False
+
+        def _mixing(m) -> bool:
+            if m is None or not hasattr(m, "state_dict"):
+                return False
+            if needs_sequence_segmentation(m):
+                return True
+            members = getattr(m, "members", None) or ()
+            return any(_mixing(x) for x in members)
+
+        candidates = [spec.get("sample_adapter")]
+        candidates.extend((spec.get("adapters") or {}).values())
+        return any(_mixing(m) for m in candidates)
+    except Exception as e:  # noqa: BLE001 — advisory check, fail open
+        logger.warning(
+            "adapter_config_needs_eager: could not inspect adapter_config "
+            "(%s); leaving execution mode unchanged.", e)
+        return False
 
 
 # ---------------------------------------------------------------------------

@@ -1133,6 +1133,23 @@ class EngineArgs:
         """
         current_platform.pre_register_and_update()
 
+        # Sequence-mixing adaptations (chunked scans / mixers) are
+        # eager-only on every architecture: per-request segmentation is
+        # eager-only, and their symbolic-length pad branches miscompile
+        # under the general-shape compile.  Force eager for the baked
+        # route before compilation is configured.
+        if self.adapter_config and not self.enforce_eager:
+            from vllm.adaptation.specs import adapter_config_needs_eager
+            if adapter_config_needs_eager(self.adapter_config):
+                logger.warning(
+                    "adapter_config carries a sequence-mixing adaptation; "
+                    "forcing enforce_eager=True (chunked scans are "
+                    "eager-only under vLLM serving: per-request "
+                    "segmentation and symbolic-shape chunk padding are "
+                    "incompatible with CUDA graphs / general-shape "
+                    "compilation).")
+                self.enforce_eager = True
+
         device_config = DeviceConfig(
             device=cast(Device, current_platform.device_type))
 
