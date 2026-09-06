@@ -29,13 +29,17 @@ class LoRARequest(
     long_lora_max_len: Optional[int] = None
     base_model_name: Optional[str] = msgspec.field(default=None)
     tensorizer_config_dict: Optional[dict] = None
-    lora_position: str = "all"  # "all", "prefill" or "decode"
+    # "all", "prefill", "decode", or "decode_b" (decode plus the final
+    # prompt token — the position whose forward produces the first
+    # sampled token; mirrors the stream route's decode_b mask).
+    lora_position: str = "all"
 
     def __post_init__(self):
-        if self.lora_position not in ("all", "prefill", "decode"):
+        if self.lora_position not in ("all", "prefill", "decode",
+                                      "decode_b"):
             raise ValueError(
-                f"lora_position must be 'all', 'prefill' or 'decode', "
-                f"got {self.lora_position!r}")
+                f"lora_position must be 'all', 'prefill', 'decode' or "
+                f"'decode_b', got {self.lora_position!r}")
         if self.lora_int_id < 1:
             raise ValueError(f"id must be > 0, got {self.lora_int_id}")
         if self.lora_local_path:

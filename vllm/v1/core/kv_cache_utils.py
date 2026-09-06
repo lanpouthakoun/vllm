@@ -510,7 +510,9 @@ def _gen_lora_extra_hash_keys(request: Request) -> list[int]:
     must never be shared across adapters.  Decode-only adapters
     (``lora_position="decode"`` and the ``decode_lora_request`` slot)
     never touch prefill KV — excluding them lets their requests share
-    cached prefills with the base model.
+    cached prefills with the base model.  ``decode_b`` adapters DO
+    touch prefill KV (they fire on the final prompt token), so they
+    key the hash like prefill/all adapters (the default path below).
 
     Args:
         request: The request object.

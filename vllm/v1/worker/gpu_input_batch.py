@@ -29,7 +29,10 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 
 # Numeric codes stored in InputBatch.request_lora_position.
-_LORA_POSITION_CODES = {"all": 0, "prefill": 1, "decode": 2}
+# decode_b = decode plus the final prompt token (the boundary position
+# whose forward samples the first output token) — token-level overlay
+# in make_lora_inputs, matching the stream route's decode_b mask.
+_LORA_POSITION_CODES = {"all": 0, "prefill": 1, "decode": 2, "decode_b": 3}
 
 
 @dataclass
@@ -250,7 +253,8 @@ class InputBatch:
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs, ),
                                              dtype=np.int32)
-        # lora_position: 0 = "all" (default), 1 = "prefill", 2 = "decode"
+        # lora_position: 0 = "all" (default), 1 = "prefill",
+        # 2 = "decode", 3 = "decode_b" (decode + boundary token)
         self.request_lora_position = np.zeros((self.max_num_reqs, ),
                                               dtype=np.int8)
         # Optional second adapter that applies only during the decode
@@ -946,8 +950,11 @@ class InputBatch:
                          >= self.num_prompt_tokens[:num_reqs])
 
             # Adapter id each request contributes during the prefill
-            # phase: the primary adapter unless it is decode-only.
-            prefill_ids = np.where(req_lora_position == 2, 0,
+            # phase: the primary adapter unless it is decode-only or
+            # decode_b (which fires on prefill steps only through the
+            # boundary-token overlay below).
+            prefill_ids = np.where((req_lora_position == 2)
+                                   | (req_lora_position == 3), 0,
                                    req_lora_mapping)
             # Adapter id during the decode phase: the dedicated decode
             # adapter if present, else the primary unless prefill-only.
@@ -958,9 +965,37 @@ class InputBatch:
 
             effective_ids = np.where(is_decode, decode_ids,
                                      prefill_ids).astype(np.int32)
+            token_ids = effective_ids.repeat(num_scheduled_tokens)
+
+            # decode_b boundary overlay (token-level): during the FINAL
+            # prefill chunk, the last prompt token's forward produces
+            # the first sampled token; a decode_b adapter applies to
+            # exactly that token, matching the HF training semantics
+            # (pos >= loc) and the stream route's decode_b mask
+            # (decode ∪ last-prompt-token).  Earlier prompt tokens and
+            # earlier chunks stay adapter-free.
+            is_db = req_lora_position == 3
+            if np.any(is_db):
+                ns = num_scheduled_tokens[:num_reqs]
+                final_chunk = (~is_decode
+                               & (self.num_computed_tokens_cpu[:num_reqs]
+                                  + ns
+                                  >= self.num_prompt_tokens[:num_reqs]))
+                fire = is_db & final_chunk & (req_lora_mapping != 0)
+                if np.any(fire):
+                    starts = np.cumsum(ns) - ns
+                    boundary_off = (self.num_prompt_tokens[:num_reqs]
+                                    - self.num_computed_tokens_cpu[:num_reqs]
+                                    - 1)
+                    idx = (starts + boundary_off)[fire]
+                    token_ids[idx] = req_lora_mapping[fire]
+                    # The boundary forward samples the first token, so
+                    # the request-level (sampling-side) id follows it.
+                    effective_ids = np.where(fire, req_lora_mapping,
+                                             effective_ids).astype(np.int32)
+
             prompt_lora_mapping = tuple(effective_ids)
-            token_lora_mapping = tuple(
-                effective_ids.repeat(num_scheduled_tokens))
+            token_lora_mapping = tuple(token_ids)
         else:
             prompt_lora_mapping = tuple(req_lora_mapping)
             token_lora_mapping = tuple(
