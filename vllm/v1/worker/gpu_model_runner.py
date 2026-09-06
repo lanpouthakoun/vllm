@@ -2733,6 +2733,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 max_adapters=self.vllm_config.max_adapters,
                 max_cpu_adapters=self.vllm_config.max_cpu_adapters,
                 device=self.device,
+                chunked_prefill_enabled=self.vllm_config.scheduler_config.
+                chunked_prefill_enabled,
             )
         if self._adapter_layers:
             logger.info("[adapter] Found %d adapter layers for multi-adapter "

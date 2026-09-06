@@ -81,11 +81,16 @@ class AdapterManager:
         max_cpu_adapters: int = 1024,
         device: torch.device = torch.device("cuda"),
         model_dtype: torch.dtype = torch.bfloat16,
+        chunked_prefill_enabled: bool = False,
     ):
         self.adapter_layers = adapter_layers
         self.max_adapters = max_adapters
         self.device = device
         self.model_dtype = model_dtype
+        # Engine scheduler setting, for the sequence-mixing serving
+        # warning below (the dynamic route cannot be guarded at
+        # engine-config time: members are only known at load).
+        self.chunked_prefill_enabled = chunked_prefill_enabled
 
         # Slot map: index → adapter id (None = free).
         self.adapter_index_to_id: list[Optional[int]] = [None] * max_adapters
@@ -159,6 +164,27 @@ class AdapterManager:
                                "this should not happen.")
 
         self.adapter_index_to_id[slot] = adapter_id
+
+        # Serving-contract warning: recurrent scan state does not carry
+        # across prefill chunks (protocol.py check_adaptation_supported
+        # contract).  The baked route forces unchunked prefill at
+        # engine-config time; the dynamic route can only warn here —
+        # the scheduler config is already frozen.
+        if self.chunked_prefill_enabled:
+            from vllm.adaptation.specs import adapter_config_needs_eager
+            if adapter_config_needs_eager(adapter_model.adapter_config):
+                logger.warning(
+                    "sequence-mixing adaptation id=%d loaded while "
+                    "chunked prefill is enabled: scan state resets at "
+                    "every prefill chunk boundary, silently truncating "
+                    "the member's effective window — both for prompts "
+                    "longer than max_num_batched_tokens and for short "
+                    "prompts split by batch packing.  Serve "
+                    "sequence-mixing members with "
+                    "enable_chunked_prefill=False and "
+                    "max_num_batched_tokens >= max_model_len (the "
+                    "baked adapter_config route enforces this "
+                    "automatically).", adapter_id)
 
         # Load weights into decoder layers.
         count = self._load_adapter_to_layers(adapter_model)

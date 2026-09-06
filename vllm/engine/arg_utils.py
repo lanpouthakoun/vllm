@@ -1191,6 +1191,12 @@ class EngineArgs:
             self.enable_chunked_prefill = False
         assert self.enable_chunked_prefill is not None
 
+        # Sequence-mixing adaptations: scan state does not carry across
+        # prefill chunks — force whole-prompt prefill scheduling.  Must
+        # run AFTER _set_default_args, which turns chunked prefill on
+        # unconditionally for v1 generate models.
+        self._enforce_unchunked_prefill_for_sequence_mixing(model_config)
+
         sliding_window: Optional[int] = None
         if not is_interleaved(model_config.hf_text_config):
             # Only set CacheConfig.sliding_window if the model is all sliding
@@ -1562,6 +1568,51 @@ class EngineArgs:
         #############################################################
 
         return True
+
+    def _enforce_unchunked_prefill_for_sequence_mixing(
+            self, model_config: ModelConfig) -> None:
+        """Baked sequence-mixing adaptations require whole-prompt prefill.
+
+        Recurrent scans rebuild state from zero inside every forward
+        pass (the ``check_adaptation_supported`` contract,
+        vllm/adaptation/protocol.py), so a chunked prefill silently
+        resets a member's scan at each chunk boundary.  Chunking splits
+        prompts through TWO channels: prompts longer than
+        ``max_num_batched_tokens``, and the v1 scheduler's batch
+        packing, which admits a waiting prompt PARTIALLY into a step's
+        leftover token budget (scheduler.py ``num_new_tokens =
+        min(num_new_tokens, token_budget)``) — so even short prompts
+        split in bulk-generate workloads.  Disabling chunked prefill
+        closes both channels (the scheduler then SKIPS, never splits, a
+        prompt that does not fit the remaining budget); raising
+        ``max_num_batched_tokens`` to ``max_model_len`` guarantees any
+        legal prompt fits one step.  Companion policy to the
+        enforce_eager rule above; runs after ``_set_default_args``
+        (which forces chunked prefill ON for v1 generate models).
+        """
+        if not self.adapter_config:
+            return
+        from vllm.adaptation.specs import adapter_config_needs_eager
+        # Same predicate as the eager policy: does the baked config
+        # carry a sequence-mixing member (composites recursed)?
+        if not adapter_config_needs_eager(self.adapter_config):
+            return
+        needs_budget_raise = (
+            self.max_num_batched_tokens is None
+            or self.max_num_batched_tokens < model_config.max_model_len)
+        if self.enable_chunked_prefill or needs_budget_raise:
+            logger.warning(
+                "adapter_config carries a sequence-mixing adaptation; "
+                "forcing unchunked prefill (enable_chunked_prefill="
+                "False, max_num_batched_tokens>=max_model_len=%d): "
+                "recurrent scan state does not carry across prefill "
+                "chunks, so chunking would silently reset the member's "
+                "scan mid-prompt — both for prompts longer than the "
+                "step token budget and for short prompts split by "
+                "batch packing.", model_config.max_model_len)
+        self.enable_chunked_prefill = False
+        if needs_budget_raise:
+            self.max_num_batched_tokens = model_config.max_model_len
 
     def _set_default_args(self, usage_context: UsageContext,
                           model_config: ModelConfig) -> None:

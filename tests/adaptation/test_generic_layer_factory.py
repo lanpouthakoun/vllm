@@ -351,6 +351,117 @@ class TestSequenceMixingEagerPolicy:
         assert adapter_config_needs_eager(None) is False
 
 
+class TestSequenceMixingUnchunkedPrefillPolicy:
+    """Baked sequence-mixing adaptations force UNCHUNKED prefill at
+    engine-config time: scan state rebuilds from zero every forward
+    (protocol.py contract), so a chunked prefill silently resets the
+    member's recurrence at each chunk boundary.  The v1 scheduler
+    splits prompts both when they exceed max_num_batched_tokens and
+    when a short waiting prompt is admitted partially into a step's
+    leftover budget (batch packing) — disabling chunked prefill closes
+    both channels (the scheduler skips, never splits)."""
+
+    def _config_for(self, adapter):
+        from vllm.adaptation.specs import spec_to_adapter_config
+        return spec_to_adapter_config({
+            "layer_indices": [0],
+            "position": "all",
+            "sample_adapter": adapter,
+            "adapters": {0: adapter},
+        })
+
+    def _engine_args(self, cfg, chunked=True, budget=16384):
+        from vllm.engine.arg_utils import EngineArgs
+        args = EngineArgs(model="dummy")
+        args.adapter_config = cfg
+        args.enable_chunked_prefill = chunked
+        args.max_num_batched_tokens = budget
+        return args
+
+    _model_config = SimpleNamespace(max_model_len=65536)
+
+    def test_sequence_mixing_forces_unchunked_and_raises_budget(self):
+        args = self._engine_args(
+            self._config_for(ChunkScanAdapter(chunk=4, value=1.0)))
+        args._enforce_unchunked_prefill_for_sequence_mixing(
+            self._model_config)
+        assert args.enable_chunked_prefill is False
+        assert args.max_num_batched_tokens == 65536
+
+    def test_budget_none_becomes_max_model_len(self):
+        args = self._engine_args(
+            self._config_for(ChunkScanAdapter(chunk=4, value=1.0)),
+            budget=None)
+        args._enforce_unchunked_prefill_for_sequence_mixing(
+            self._model_config)
+        assert args.enable_chunked_prefill is False
+        assert args.max_num_batched_tokens == 65536
+
+    def test_larger_budget_is_not_lowered(self):
+        args = self._engine_args(
+            self._config_for(ChunkScanAdapter(chunk=4, value=1.0)),
+            budget=131072)
+        args._enforce_unchunked_prefill_for_sequence_mixing(
+            self._model_config)
+        assert args.enable_chunked_prefill is False
+        assert args.max_num_batched_tokens == 131072
+
+    def test_elementwise_config_untouched(self):
+        args = self._engine_args(self._config_for(ConstAdapter(0.5)))
+        args._enforce_unchunked_prefill_for_sequence_mixing(
+            self._model_config)
+        assert args.enable_chunked_prefill is True
+        assert args.max_num_batched_tokens == 16384
+
+    def test_no_config_untouched(self):
+        args = self._engine_args(None)
+        args._enforce_unchunked_prefill_for_sequence_mixing(
+            self._model_config)
+        assert args.enable_chunked_prefill is True
+        assert args.max_num_batched_tokens == 16384
+
+    def test_dynamic_route_warns_at_activation(self, caplog):
+        import logging as _logging
+
+        from vllm.adaptation.manager import AdapterManager, ServedAdapter
+        mgr = AdapterManager(adapter_layers=[],
+                             device=torch.device("cpu"),
+                             chunked_prefill_enabled=True)
+        mgr.add_adapter(ServedAdapter(
+            id=1, position="all",
+            adapter_config=self._config_for(
+                ChunkScanAdapter(chunk=4, value=1.0))))
+        # vllm loggers do not propagate to root; capture directly.
+        lg = _logging.getLogger("vllm.adaptation.manager")
+        lg.addHandler(caplog.handler)
+        try:
+            mgr.activate_adapter(1)
+        finally:
+            lg.removeHandler(caplog.handler)
+        assert any("chunked prefill" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_dynamic_route_silent_when_unchunked(self, caplog):
+        import logging as _logging
+
+        from vllm.adaptation.manager import AdapterManager, ServedAdapter
+        mgr = AdapterManager(adapter_layers=[],
+                             device=torch.device("cpu"),
+                             chunked_prefill_enabled=False)
+        mgr.add_adapter(ServedAdapter(
+            id=1, position="all",
+            adapter_config=self._config_for(
+                ChunkScanAdapter(chunk=4, value=1.0))))
+        lg = _logging.getLogger("vllm.adaptation.manager")
+        lg.addHandler(caplog.handler)
+        try:
+            mgr.activate_adapter(1)
+        finally:
+            lg.removeHandler(caplog.handler)
+        assert not any("chunked prefill" in r.getMessage()
+                       for r in caplog.records)
+
+
 class TestMaybeAdapterLayerType:
 
     def _vllm_config(self, enable_adapters, adapter_config=None):
