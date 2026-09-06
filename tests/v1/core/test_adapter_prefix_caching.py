@@ -12,19 +12,19 @@ a decode-adapter request shares cached prefills with the base model.
 from types import SimpleNamespace
 
 from vllm.lora.request import LoRARequest
-from vllm.adaptation.request import ReFTRequest
+from vllm.adaptation.request import AdapterRequest
 from vllm.v1.core.kv_cache_utils import (generate_block_hash_extra_keys,
                                          need_extra_keys)
 
 
-def _req(lora_request=None, decode_lora_request=None, reft_request=None,
-         decode_reft_request=None, cache_salt=None):
+def _req(lora_request=None, decode_lora_request=None, adapter_request=None,
+         decode_adapter_request=None, cache_salt=None):
     return SimpleNamespace(
         mm_features=[],
         lora_request=lora_request,
         decode_lora_request=decode_lora_request,
-        reft_request=reft_request,
-        decode_reft_request=decode_reft_request,
+        adapter_request=adapter_request,
+        decode_adapter_request=decode_adapter_request,
         cache_salt=cache_salt,
     )
 
@@ -34,9 +34,9 @@ def _lora(idx, position="all"):
                        lora_path=f"/l/{idx}", lora_position=position)
 
 
-def _reft(idx, position=None):
-    return ReFTRequest(reft_name=f"r{idx}", reft_int_id=idx,
-                       reft_path=f"/r/{idx}", reft_position=position)
+def _adapter(idx, position=None):
+    return AdapterRequest(adapter_name=f"r{idx}", adapter_int_id=idx,
+                       adapter_path=f"/r/{idx}", adapter_position=position)
 
 
 def _keys(request):
@@ -70,44 +70,44 @@ class TestReftHashKeys:
 
     def test_unknown_position_conservatively_included(self):
         # The adapter's position lives worker-side; without a declared
-        # reft_position the hasher must assume it can touch prefill KV.
-        assert _keys(_req(reft_request=_reft(5))) == ("reft:5", )
+        # adapter_position the hasher must assume it can touch prefill KV.
+        assert _keys(_req(adapter_request=_adapter(5))) == ("adapter:5", )
 
     def test_prefill_position_included(self):
-        assert _keys(_req(reft_request=_reft(5, "prefill"))) == ("reft:5", )
+        assert _keys(_req(adapter_request=_adapter(5, "prefill"))) == ("adapter:5", )
 
     def test_decode_position_excluded(self):
-        assert _keys(_req(reft_request=_reft(5, "decode"))) is None
+        assert _keys(_req(adapter_request=_adapter(5, "decode"))) is None
 
     def test_decode_slot_follows_declared_position(self):
         # Pairing convention loads the decode slot's adapter with
         # position="decode"; declaring it on the request unlocks cache
         # sharing.  Undeclared stays conservative.
-        keys = _keys(_req(reft_request=_reft(5, "prefill"),
-                          decode_reft_request=_reft(6, "decode")))
-        assert keys == ("reft:5", )
-        keys = _keys(_req(reft_request=_reft(5, "prefill"),
-                          decode_reft_request=_reft(6)))
-        assert keys == ("reft:5", "reft:6")
+        keys = _keys(_req(adapter_request=_adapter(5, "prefill"),
+                          decode_adapter_request=_adapter(6, "decode")))
+        assert keys == ("adapter:5", )
+        keys = _keys(_req(adapter_request=_adapter(5, "prefill"),
+                          decode_adapter_request=_adapter(6)))
+        assert keys == ("adapter:5", "adapter:6")
 
     def test_different_prefill_adapters_hash_differently(self):
-        a = _keys(_req(reft_request=_reft(5, "prefill")))
-        b = _keys(_req(reft_request=_reft(7, "prefill")))
+        a = _keys(_req(adapter_request=_adapter(5, "prefill")))
+        b = _keys(_req(adapter_request=_adapter(7, "prefill")))
         assert a != b
 
-    def test_lora_and_reft_keys_do_not_collide(self):
+    def test_lora_and_adapter_keys_do_not_collide(self):
         lora_keys = _keys(_req(lora_request=_lora(5, "all")))
-        reft_keys = _keys(_req(reft_request=_reft(5, "prefill")))
-        assert lora_keys != reft_keys
+        adapter_keys = _keys(_req(adapter_request=_adapter(5, "prefill")))
+        assert lora_keys != adapter_keys
 
 
 class TestNeedExtraKeys:
 
-    def test_reft_request_triggers_extra_keys(self):
-        assert need_extra_keys(_req(reft_request=_reft(5)))
+    def test_adapter_request_triggers_extra_keys(self):
+        assert need_extra_keys(_req(adapter_request=_adapter(5)))
 
-    def test_decode_reft_slot_triggers_extra_keys(self):
-        assert need_extra_keys(_req(decode_reft_request=_reft(6)))
+    def test_decode_adapter_slot_triggers_extra_keys(self):
+        assert need_extra_keys(_req(decode_adapter_request=_adapter(6)))
 
     def test_plain_request_does_not(self):
         assert not need_extra_keys(_req())
@@ -116,11 +116,11 @@ class TestNeedExtraKeys:
 class TestReftRequestPositionField:
 
     def test_default_none(self):
-        assert _reft(1).reft_position is None
+        assert _adapter(1).adapter_position is None
 
     def test_roundtrip(self):
         import msgspec
-        req = _reft(2, "decode")
+        req = _adapter(2, "decode")
         out = msgspec.msgpack.decode(msgspec.msgpack.encode(req),
-                                     type=ReFTRequest)
-        assert out.reft_position == "decode"
+                                     type=AdapterRequest)
+        assert out.adapter_position == "decode"
