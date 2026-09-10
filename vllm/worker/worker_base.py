@@ -248,6 +248,23 @@ class WorkerBase:
         # reason rather than serve a span that overwrites the host's K/V.
         from vllm.adaptation.recirculation import refuse_rewired
         refuse_rewired(adapter_config, "multisite")
+        # A member may DECLARE what the engine must be configured as
+        # (unchunked prefill, eager) for its computation to be the one it
+        # was trained as.  On this route the engine config was frozen
+        # before the RPC could run, so nothing here can still be forced —
+        # the declaration was supposed to reach
+        # EngineArgs.adapter_serving_requirements before LLM(...).  This
+        # is the re-check: it REFUSES, by member and requirement, when the
+        # engine cannot satisfy what the member asks for, rather than
+        # serving a scan that resets at every prefill chunk boundary and
+        # still reads fluently.  Members that declare nothing (every leaf
+        # in the zoo but the faithful native ones) reach exactly the
+        # behaviour they had before.
+        from vllm.adaptation.specs import (
+            check_serving_requirements_honoured)
+        check_serving_requirements_honoured(
+            adapter_config, getattr(self, "vllm_config", None),
+            label=f"id={adapter_int_id} at site={site}")
         # Prompt-anchored positions silently break under an external
         # KV prefix — warn at load time (undetectable at mask time).
         from vllm.adaptation.layer import warn_if_prefix_incompatible_position

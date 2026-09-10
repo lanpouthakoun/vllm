@@ -91,7 +91,8 @@ from typing import Any, Optional
 import torch
 from torch import nn
 
-from vllm.adaptation.protocol import (SUPPORTED_WRITE_LABELS, apply_write,
+from vllm.adaptation.protocol import (MULTISITE_HONOURS_UNCHUNKED_PREFILL,
+                                      SUPPORTED_WRITE_LABELS, apply_write,
                                       port_order, require_pair_ports,
                                       validate_site, validate_write_port)
 
@@ -105,6 +106,12 @@ __all__ = [
     # definition (and the reasoning for what is in the set) lives next
     # to apply_write in vllm/adaptation/protocol.py.
     "SUPPORTED_WRITE_LABELS",
+    # Second capability the serving builder probes on this module: does
+    # the fork honour a member's unchunked-prefill declaration on the
+    # MULTISITE route (adapter_config unset at engine-config time)?  The
+    # definition, and why the answer is not simply "chunked prefill is
+    # off", lives beside SUPPORTED_WRITE_LABELS in protocol.py.
+    "MULTISITE_HONOURS_UNCHUNKED_PREFILL",
     "RecircPlan",
     "config_rewires",
     "install_recirculation",

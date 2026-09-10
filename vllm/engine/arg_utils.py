@@ -471,6 +471,17 @@ class EngineArgs:
         get_field(VllmConfig, "additional_config")
 
     adapter_config: Optional[dict] = None
+    # What the members this engine will serve DECLARE they need of it.
+    # ``{"unchunked_prefill": bool, "eager": bool, "declared_by": [str]}``.
+    # The BAKED route does not need this: its adapter_config rides the
+    # EngineArgs, so the policies below can read the requirement off the
+    # member directly.  The MULTISITE route has no member yet at this
+    # point — LLM(...) is built first and members arrive later by
+    # collective_rpc("load_adapter", ...) — so its builder declares here
+    # instead, and vllm/adaptation/protocol.py
+    # MULTISITE_HONOURS_UNCHUNKED_PREFILL is the capability flag that
+    # tells the builder this field is read.
+    adapter_serving_requirements: Optional[dict] = None
     enable_adapters: bool = False
     max_adapters: int = 256
     max_cpu_adapters: int = 1024
@@ -1138,6 +1149,22 @@ class EngineArgs:
         # eager-only, and their symbolic-length pad branches miscompile
         # under the general-shape compile.  Force eager for the baked
         # route before compilation is configured.
+        if self.adapter_serving_requirements and not self.enforce_eager:
+            from vllm.adaptation.specs import (
+                normalize_serving_requirements)
+            _declared = normalize_serving_requirements(
+                self.adapter_serving_requirements)
+            # A member that needs whole-prompt prefill needs eager for
+            # the SAME reason (its scan is the thing that breaks under
+            # both), so the two ride one predicate here exactly as they
+            # do on the baked route.
+            if _declared["eager"] or _declared["unchunked_prefill"]:
+                logger.warning(
+                    "members %s declare they must be served eagerly "
+                    "(adapter_serving_requirements); forcing "
+                    "enforce_eager=True before compilation is "
+                    "configured.", _declared["declared_by"] or "(unnamed)")
+                self.enforce_eager = True
         if self.adapter_config and not self.enforce_eager:
             from vllm.adaptation.recirculation import config_rewires
             from vllm.adaptation.specs import adapter_config_needs_eager
@@ -1584,7 +1611,7 @@ class EngineArgs:
 
     def _enforce_unchunked_prefill_for_sequence_mixing(
             self, model_config: ModelConfig) -> None:
-        """Baked sequence-mixing adaptations require whole-prompt prefill.
+        """Sequence-mixing adaptations require whole-prompt prefill.
 
         Recurrent scans rebuild state from zero inside every forward
         pass (the ``check_adaptation_supported`` contract,
@@ -1602,7 +1629,47 @@ class EngineArgs:
         legal prompt fits one step.  Companion policy to the
         enforce_eager rule above; runs after ``_set_default_args``
         (which forces chunked prefill ON for v1 generate models).
+
+        TWO channels reach this policy, because two routes install a
+        member and only one of them has a member to inspect here:
+
+          * BAKED — ``adapter_config`` rides the EngineArgs, so the
+            sequence-mixing predicate can be evaluated against the
+            member itself.
+          * MULTISITE — ``LLM(...)`` is built FIRST and members arrive
+            later by ``collective_rpc("load_adapter", ...)``.
+            ``adapter_config`` is None here, so this method used to
+            return at its first line and ``_set_default_args``'
+            unconditional ``enable_chunked_prefill = True`` stood: a
+            sequence-mixing member mounted anywhere but ``block_output``
+            served with its scan reset at every chunk boundary, fluently
+            and without an error.  Its builder therefore DECLARES the
+            requirement up front in
+            ``adapter_serving_requirements``, and that declaration is
+            honoured here with the same force.  It is re-checked against
+            the frozen config when the member lands
+            (``vllm.adaptation.specs.check_serving_requirements_honoured``,
+            called from ``WorkerBase.load_adapter``), which refuses by
+            member and requirement if the engine was built without it.
         """
+        from vllm.adaptation.specs import normalize_serving_requirements
+        declared = normalize_serving_requirements(
+            self.adapter_serving_requirements)
+        if declared["unchunked_prefill"]:
+            needs_budget_raise = (
+                self.max_num_batched_tokens is None
+                or self.max_num_batched_tokens < model_config.max_model_len)
+            if self.enable_chunked_prefill or needs_budget_raise:
+                logger.warning(
+                    "members %s declare they require unchunked prefill "
+                    "(adapter_serving_requirements); forcing "
+                    "enable_chunked_prefill=False and "
+                    "max_num_batched_tokens>=max_model_len=%d.",
+                    declared["declared_by"] or "(unnamed)",
+                    model_config.max_model_len)
+            self.enable_chunked_prefill = False
+            if needs_budget_raise:
+                self.max_num_batched_tokens = model_config.max_model_len
         if not self.adapter_config:
             return
         from vllm.adaptation.recirculation import config_rewires

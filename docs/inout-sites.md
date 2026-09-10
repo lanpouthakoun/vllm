@@ -270,6 +270,34 @@ baseline an order of magnitude above the HF path.
   writes and neither route exists here, so a payload assembled the way
   this engine assembles it is not the payload they expect. A route that
   grows adds its label in the same commit.
+- **A capability surface for declared serving requirements.**
+  `vllm.adaptation.protocol.MULTISITE_HONOURS_UNCHUNKED_PREFILL` (also
+  re-exported on `recirculation`) answers one question: does this fork
+  honour a member's `serving_requires_unchunked_prefill` /
+  `serving_requires_eager` declaration on the **multisite** route, not
+  only on the baked one? It did not, and the gap was silent. The baked
+  route puts `adapter_config` on the `EngineArgs`, so
+  `_enforce_unchunked_prefill_for_sequence_mixing` sees the member
+  before the scheduler is configured; the multisite route builds
+  `LLM(...)` first and delivers members afterwards by
+  `collective_rpc("load_adapter", ...)`, so `adapter_config` is `None`
+  at that moment and the policy returned at its first line — while
+  `_set_default_args` turns `enable_chunked_prefill` on
+  *unconditionally* for every v1 generate model. A sequence-mixing
+  member at any site but `block_output` therefore served with its scan
+  reset at every prefill chunk boundary, fluently and without an error.
+  Two halves close it: the builder DECLARES up front in
+  `EngineArgs.adapter_serving_requirements`
+  (`{"unchunked_prefill", "eager", "declared_by"}`), which the same
+  policy forces with the same force and after the same
+  `_set_default_args`; and `WorkerBase.load_adapter` RE-CHECKS the
+  declaration against the frozen config when the member lands
+  (`specs.check_serving_requirements_honoured`) and **refuses by member
+  and requirement** if the engine was built without it — nothing can be
+  corrected at that point, so refusing is the only honest option. The
+  declaration is read off the reconstructed member, so it travels with
+  the class rather than the manifest; a member that declares nothing
+  gets exactly the engine it got before.
 - Both residual contracts: llama-style
   `(positions, hidden, residual) -> (hidden, residual)` and the
   residual-free olmo2-style `(positions, hidden) -> hidden`. The host's

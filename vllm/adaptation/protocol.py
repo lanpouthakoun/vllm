@@ -14,6 +14,9 @@ __all__ = [
     "WRITE_PORTS",
     "HAVE_PAIR_PORTS",
     "SUPPORTED_WRITE_LABELS",
+    "MULTISITE_HONOURS_UNCHUNKED_PREFILL",
+    "SERVING_REQUIREMENT_ATTRS",
+    "declared_serving_requirements",
     "apply_adaptation",
     "apply_write",
     "readout_then_write",
@@ -198,6 +201,76 @@ def apply_write(adaptation: nn.Module, h_out: torch.Tensor,
 # the exact failure the W axis exists to make loud.  A route that grows
 # adds its label here in the same commit that implements it.
 SUPPORTED_WRITE_LABELS = frozenset({"replace", "interpolate"})
+
+# ---------------------------------------------------------------------
+# Serving-requirement capability surface.
+#
+# A member may DECLARE what the engine must be configured as for its
+# computation to be the one it was trained as.  The declaration is a
+# property of the member (a class attribute on the leaf, written by the
+# adapters library), and the engine's job is to honour it or to refuse.
+#
+# Two routes install a member and only one of them used to honour these:
+#
+#   * BAKED — ``adapter_config`` rides ``EngineArgs`` at construction,
+#     so ``_enforce_unchunked_prefill_for_sequence_mixing`` sees the
+#     member before the scheduler is configured and forces the setting.
+#   * MULTISITE — ``LLM(...)`` is built FIRST and members arrive later
+#     by ``collective_rpc("load_adapter", ...)``.  ``adapter_config`` is
+#     None at engine-config time, so every policy gated on
+#     ``if not self.adapter_config`` was INERT here, while
+#     ``_set_default_args`` turns ``enable_chunked_prefill`` on
+#     unconditionally for every v1 generate model.  A sequence-mixing
+#     member mounted at, say, ``linear:self_attn.v_proj`` therefore
+#     served with its scan silently reset at every chunk boundary, and
+#     the output still read fluently.
+#
+# This flag is the ANSWER to "does this fork honour an unchunked-prefill
+# declaration on the multisite route too?".  It is True from the commit
+# that made it so: the declaration is carried to engine-config time in
+# ``EngineArgs.adapter_serving_requirements`` (forced there), and
+# re-checked against the FROZEN config at load time in
+# ``WorkerBase.load_adapter``, which REFUSES by member and requirement
+# when the engine cannot satisfy it.  A builder that cannot find this
+# name is talking to a fork that predates the guarantee and must keep
+# refusing such a member itself — the same "unknown is not yes" rule
+# that governs SUPPORTED_WRITE_LABELS above.
+MULTISITE_HONOURS_UNCHUNKED_PREFILL = True
+
+# The leaf attributes that carry a declaration.  Named here because the
+# fork READS them off a reconstructed member: they travel with the class,
+# not with the manifest, so a member exported by any version of the
+# adapters library declares the same way.
+SERVING_REQUIREMENT_ATTRS = {
+    "unchunked_prefill": "serving_requires_unchunked_prefill",
+    "eager": "serving_requires_eager",
+}
+
+
+def declared_serving_requirements(adaptation: nn.Module) -> dict:
+    """What *adaptation* declares it needs from the engine.
+
+    Returns ``{"unchunked_prefill": bool, "eager": bool}``.  Composites
+    (``adaptation.members``) are recursed: a declaration does not
+    disappear by being wrapped, exactly as
+    ``check_adaptation_supported`` treats a rejection.
+
+    Only an EXPLICIT declaration counts.  Sequence mixing is a separate,
+    inferred predicate (``needs_sequence_segmentation``) that the baked
+    route uses; conflating the two here would newly constrain every
+    mixer member on the multisite route, which is a policy change and
+    not this surface's business.
+    """
+    out = {k: False for k in SERVING_REQUIREMENT_ATTRS}
+    if adaptation is None:
+        return out
+    for key, attr in SERVING_REQUIREMENT_ATTRS.items():
+        if bool(getattr(adaptation, attr, False)):
+            out[key] = True
+    for member in (getattr(adaptation, "members", None) or ()):
+        for key, value in declared_serving_requirements(member).items():
+            out[key] = out[key] or value
+    return out
 
 
 def readout_then_write(adaptation: nn.Module,

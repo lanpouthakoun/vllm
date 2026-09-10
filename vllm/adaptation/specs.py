@@ -43,6 +43,10 @@ __all__ = [
     "adapter_config_to_spec",
     "adapter_config_needs_eager",
     "adapter_config_rewires",
+    "adapter_config_serving_requirements",
+    "merge_serving_requirements",
+    "normalize_serving_requirements",
+    "check_serving_requirements_honoured",
     "spec_to_adapter_config",
     # Deprecated global-state API (backward compat only):
     "set_adapter_spec",
@@ -278,6 +282,176 @@ def adapter_config_needs_eager(adapter_config: Optional[dict[str, Any]],
             "adapter_config_needs_eager: could not inspect adapter_config "
             "(%s); leaving execution mode unchanged.", e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Declared serving requirements (both routes)
+# ---------------------------------------------------------------------------
+#
+# A member declares what the engine must BE for its computation to be the
+# one it was trained as (vllm/adaptation/protocol.py
+# ``SERVING_REQUIREMENT_ATTRS``).  The declaration rides the member
+# itself — a class attribute on the leaf — so it survives every
+# adapter_config round trip that survives the member at all, and the
+# three functions here are the fork's whole view of it:
+#
+#   * ``adapter_config_serving_requirements`` reads a declaration off ONE
+#     member's config (the multisite load path receives exactly this).
+#   * ``normalize_serving_requirements`` / ``merge_serving_requirements``
+#     handle the aggregate the BUILDER hands to engine-config time
+#     through ``EngineArgs.adapter_serving_requirements``, since on the
+#     multisite route no member has arrived yet when the scheduler is
+#     configured.
+#   * ``check_serving_requirements_honoured`` re-checks the declaration
+#     against the FROZEN config when the member actually lands, and
+#     refuses by member and requirement if it was not honoured.
+#
+# The pair matters: forcing alone would be silent if a caller built the
+# engine without declaring, and checking alone could only ever refuse.
+
+_REQUIREMENT_KEYS = ("unchunked_prefill", "eager")
+
+
+def normalize_serving_requirements(declared: Optional[dict[str, Any]],
+                                   ) -> dict[str, Any]:
+    """Coerce a builder's declaration into the fork's canonical shape.
+
+    ``{"unchunked_prefill": bool, "eager": bool, "declared_by": [str]}``.
+    Unknown keys are dropped rather than guessed at — a requirement this
+    fork does not implement must not read as honoured.
+    """
+    out: dict[str, Any] = {k: False for k in _REQUIREMENT_KEYS}
+    out["declared_by"] = []
+    if not declared:
+        return out
+    for key in _REQUIREMENT_KEYS:
+        out[key] = bool(declared.get(key, False))
+    by = declared.get("declared_by") or ()
+    if isinstance(by, str):
+        by = [by]
+    out["declared_by"] = [str(x) for x in by]
+    return out
+
+
+def merge_serving_requirements(a: dict[str, Any],
+                               b: dict[str, Any]) -> dict[str, Any]:
+    """Union of two declarations (a requirement is never relaxed)."""
+    a, b = normalize_serving_requirements(a), normalize_serving_requirements(b)
+    out = {k: (a[k] or b[k]) for k in _REQUIREMENT_KEYS}
+    out["declared_by"] = a["declared_by"] + [x for x in b["declared_by"]
+                                             if x not in a["declared_by"]]
+    return out
+
+
+def adapter_config_serving_requirements(
+        adapter_config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """What the member(s) in *adapter_config* declare they need.
+
+    Reconstructs the member (the blueprint is the only thing that knows
+    the class, and the declaration is the class's) and asks
+    ``protocol.declared_serving_requirements``.  Every per-layer copy is
+    consulted, not just ``sample_adapter``: a per-layer leaf may be a
+    different class than the sample in a composite checkpoint.
+
+    Fails OPEN (all False) when the blueprint cannot be reconstructed,
+    matching ``adapter_config_needs_eager`` — a missing adapter library
+    is already diagnosed loudly elsewhere and must not turn into a
+    fabricated requirement.
+    """
+    out: dict[str, Any] = {k: False for k in _REQUIREMENT_KEYS}
+    out["declared_by"] = []
+    if not adapter_config:
+        return out
+    try:
+        from vllm.adaptation.protocol import declared_serving_requirements
+        spec = adapter_config_to_spec(adapter_config)
+        if spec is None:
+            return out
+        members = [spec.get("sample_adapter")]
+        members.extend((spec.get("adapters") or {}).values())
+        for m in members:
+            if m is None or not hasattr(m, "state_dict"):
+                continue
+            for key, value in declared_serving_requirements(m).items():
+                if key in out:
+                    out[key] = out[key] or value
+    except Exception as e:  # noqa: BLE001 — advisory read, fail open
+        logger.warning(
+            "adapter_config_serving_requirements: could not inspect "
+            "adapter_config (%s); assuming it declares nothing.", e)
+        return {k: False for k in _REQUIREMENT_KEYS} | {"declared_by": []}
+    return out
+
+
+def check_serving_requirements_honoured(
+        adapter_config: Optional[dict[str, Any]],
+        vllm_config: Any,
+        label: str) -> dict[str, Any]:
+    """Refuse, at LOAD time, a member the frozen engine cannot serve.
+
+    This is the multisite route's half of the guarantee.  Nothing here
+    can still be CHANGED — compilation and the scheduler were configured
+    when ``LLM(...)`` was built, which is precisely why the builder is
+    expected to have passed the same declaration to
+    ``EngineArgs.adapter_serving_requirements`` — so a declaration the
+    engine does not satisfy raises with the member and the requirement
+    named.  Serving on anyway is the failure this exists to prevent: a
+    chunked prefill resets a recurrent scan mid-prompt and the output
+    still reads fluently.
+
+    Returns the declaration that was checked (all-False when the member
+    declares nothing, which is every member in the zoo but the faithful
+    native ones).
+    """
+    req = adapter_config_serving_requirements(adapter_config)
+    if not any(req[k] for k in _REQUIREMENT_KEYS):
+        return req
+    if vllm_config is None:
+        logger.warning(
+            "adapter %s declares serving requirements %s but no "
+            "vllm_config is reachable from this worker; cannot verify "
+            "that the engine honours them.", label,
+            [k for k in _REQUIREMENT_KEYS if req[k]])
+        return req
+
+    sched = getattr(vllm_config, "scheduler_config", None)
+    model = getattr(vllm_config, "model_config", None)
+    unmet: list[str] = []
+
+    if req["unchunked_prefill"] and sched is not None:
+        chunked = getattr(sched, "chunked_prefill_enabled", None)
+        if chunked:
+            unmet.append(
+                "enable_chunked_prefill is True (must be False: scan "
+                "state does not carry across prefill chunks)")
+        budget = getattr(sched, "max_num_batched_tokens", None)
+        max_len = getattr(model, "max_model_len", None) if model else None
+        if budget is not None and max_len is not None and budget < max_len:
+            unmet.append(
+                f"max_num_batched_tokens={budget} < "
+                f"max_model_len={max_len} (a legal prompt would not fit "
+                f"one step, so the scheduler would still split it)")
+    if (req["eager"] or req["unchunked_prefill"]) and model is not None:
+        if not getattr(model, "enforce_eager", False):
+            unmet.append(
+                "enforce_eager is False (per-request segmentation and "
+                "symbolic-shape chunk padding are eager-only)")
+
+    if unmet:
+        raise RuntimeError(
+            f"REFUSING to load adapter {label}: it declares "
+            f"{[k for k in _REQUIREMENT_KEYS if req[k]]} and this engine "
+            f"does not honour that — " + "; ".join(unmet) + ". The "
+            f"engine config is frozen by the time a member arrives on "
+            f"the multisite route (collective_rpc('load_adapter', ...) "
+            f"runs after LLM(...)), so the declaration has to reach "
+            f"EngineArgs.adapter_serving_requirements BEFORE the engine "
+            f"is built; vllm.adaptation.protocol."
+            f"MULTISITE_HONOURS_UNCHUNKED_PREFILL is the capability the "
+            f"serving builder probes to know it can. Serving without it "
+            f"would reset the member's recurrence at every chunk "
+            f"boundary and still produce fluent output.")
+    return req
 
 
 def adapter_config_rewires(adapter_config: Optional[dict[str, Any]],
