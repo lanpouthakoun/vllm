@@ -263,10 +263,12 @@ from vllm.adaptation.positions import (PhaseInfo,  # noqa: E402
                                        get_position_mask,
                                        position_active_in_decode)
 from vllm.adaptation.protocol import (apply_adaptation,  # noqa: E402
+                                      carrier_dtype_of,
                                       check_adaptation_supported,
                                       needs_sequence_segmentation,
                                       readout_then_write,
                                       resolve_site_submodule_path,
+                                      stamp_carrier_dtype,
                                       validate_site)
 
 
@@ -775,14 +777,43 @@ def _collect_layer_adapter_debug_stats(layer: nn.Module) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _prepare_adapter(source: nn.Module, dev: torch.device,
-                     model_dtype: torch.dtype) -> nn.Module:
-    """Deep-copy an adapter, cast linears to model dtype, install caches."""
+                     model_dtype: torch.dtype,
+                     carrier_dtype=None,
+                     label: Optional[str] = None) -> nn.Module:
+    """Deep-copy an adapter onto *dev*, resolve its CARRIER dtype, install
+    caches.
+
+    What this no longer does is cast the member's ``nn.Linear`` children
+    to the MODEL's dtype.  That cast was the fault
+    ``campaign/serving/parity_headline`` job 312676 found: a member whose
+    body casts its own input to fp32 (every leaf built on the campaign's
+    ``Fp32Stream`` shape, and the S5 ``ext`` member itself) arrived with
+    bf16 weights and died on its first matmul with ``expected mat1 and
+    mat2 to have the same dtype, but got: float != c10::BFloat16`` —
+    while a member that pins its own parameters survived only by undoing
+    the cast.  Either way the engine was choosing a member's arithmetic
+    for it, silently.
+
+    The member's weights are now left exactly as the checkpoint had
+    them, and the dtype it computes in — its CARRIER — is resolved here,
+    once, and stamped on the copy (``protocol.stamp_carrier_dtype``).
+    The two casts that remain are the ones at the port, in
+    ``protocol.readout_at_port``.  A member whose carrier cannot be
+    established is refused BY NAME, here, at load time.
+
+    Inference caches are installed at the CARRIER dtype, not the model
+    dtype: a cache is precomputed weight, and it has to be the dtype the
+    member's own matmuls run in.  For a member whose carrier is the
+    model dtype — every member that served before this axis existed —
+    that is the same call it was before.
+    """
     check_adaptation_supported(source)
     adapter_copy = copy.deepcopy(source).to(dev)
-    for child in adapter_copy.modules():
-        if isinstance(child, nn.Linear):
-            child.to(dtype=model_dtype)
-    _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
+    carrier = stamp_carrier_dtype(adapter_copy, declared=carrier_dtype,
+                                  label=label)
+    _install_adapter_caches(adapter_copy,
+                            model_dtype=carrier if carrier is not None
+                            else model_dtype)
     return adapter_copy
 
 
@@ -1384,12 +1415,21 @@ def make_adapter_decoder_layer(base_layer_cls: type,
         sample_adapter: Optional[nn.Module] = adapter_spec["sample_adapter"]
         per_layer_adapters: dict = adapter_spec.get("adapters", {})
         debug_mask_enabled = bool(adapter_spec.get("debug_mask", False))
+        # What the SERVING RECORD says the member's port dtype is
+        # (adapters.mounting.save_members writes it per record and
+        # spec_to_adapter_config passes it through).  Absent for a spec
+        # written before the carrier axis, in which case the member's
+        # own class/parameters answer — see protocol.resolve_carrier_dtype.
+        carrier_dtype = adapter_spec.get("carrier_dtype")
+        carrier_label = adapter_spec.get("label")
     else:
         layer_indices_set = frozenset()
         position = "prefill"
         sample_adapter = None
         per_layer_adapters = {}
         debug_mask_enabled = False
+        carrier_dtype = None
+        carrier_label = None
 
     arch_name = arch or base_layer_cls.__name__
 
@@ -1470,7 +1510,10 @@ def make_adapter_decoder_layer(base_layer_cls: type,
             if (layer_idx is not None and layer_idx in layer_indices_set
                     and sample_adapter is not None):
                 source = per_layer_adapters.get(layer_idx, sample_adapter)
-                adapter_copy = _prepare_adapter(source, dev, model_dtype)
+                adapter_copy = _prepare_adapter(
+                    source, dev, model_dtype, carrier_dtype=carrier_dtype,
+                    label=carrier_label or
+                    f"{type(source).__name__} (baked, L{layer_idx})")
                 _add_adapter_to_layer(self, 1, adapter_copy, position, dev)
                 _LEGACY_ADAPTER_REGISTRY[layer_idx] = adapter_copy
                 logger.debug(

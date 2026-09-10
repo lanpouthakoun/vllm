@@ -177,13 +177,20 @@ def spec_to_adapter_config(adapter_spec: dict[str, Any]) -> dict[str, Any]:
             idx: _portable_state(a) for idx, a in adapters.items()
         }
 
-    # Pass through any extra keys (e.g. debug_mask, and the pair axis:
-    # site / output_site / output_layer / passes).  This is a plain
-    # pass-through ON PURPOSE — the pair keys are written by
-    # adapters.mounting.save_members ONLY when a mount actually rewires,
-    # so a diagonal member's spec carries none of them and its config is
-    # byte-identical to what this function produced before the pair axis
-    # existed.  See adapter_config_rewires().
+    # Pass through any extra keys (e.g. debug_mask; the pair axis:
+    # site / output_site / output_layer / passes; and the member's
+    # carrier_dtype + label).  This is a plain pass-through ON PURPOSE —
+    # the pair keys are written by adapters.mounting.save_members ONLY
+    # when a mount actually rewires, so a diagonal member's spec carries
+    # none of them and its config is byte-identical to what this
+    # function produced before the pair axis existed.  See
+    # adapter_config_rewires().
+    #
+    # carrier_dtype is the dtype of the stream INSIDE the member (what
+    # the engine casts to at F_in and back from at F_out); it rides this
+    # same pass-through, and a config written before the carrier axis
+    # simply has none, in which case the member's own class/parameters
+    # answer (protocol.resolve_carrier_dtype).
     for k in adapter_spec:
         if k not in ("layer_indices", "position", "sample_adapter", "adapters"):
             config[k] = adapter_spec[k]

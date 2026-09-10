@@ -303,7 +303,17 @@ class AdapterManager:
                 continue
 
             dev = self.device
-            adapter_copy = _prepare_adapter(source, dev, self.model_dtype)
+            # The member's CARRIER dtype rides its serving record; when
+            # the record does not say, the member's own class /
+            # parameters answer, and a member for which neither can is
+            # refused BY NAME here rather than served through a guess
+            # (vllm/adaptation/protocol.py::resolve_carrier_dtype).
+            adapter_copy = _prepare_adapter(
+                source, dev, self.model_dtype,
+                carrier_dtype=(adapter_model.adapter_config or {}).get(
+                    "carrier_dtype"),
+                label=f"id={adapter_model.id} at site="
+                      f"{adapter_model.site} (L{layer_idx})")
             _add_adapter_to_layer(layer, adapter_model.id, adapter_copy,
                                   adapter_model.position, dev,
                                   site=adapter_model.site)

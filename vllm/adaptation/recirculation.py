@@ -93,8 +93,9 @@ from torch import nn
 
 from vllm.adaptation.protocol import (MULTISITE_HONOURS_UNCHUNKED_PREFILL,
                                       SUPPORTED_WRITE_LABELS, apply_write,
-                                      port_order, require_pair_ports,
-                                      validate_site, validate_write_port)
+                                      carrier_dtype_of, port_order,
+                                      require_pair_ports, validate_site,
+                                      validate_write_port)
 
 logger = logging.getLogger("vllm.adaptation.recirculation")
 
@@ -631,7 +632,16 @@ def run_recirculation(layer: nn.Module, positions, stream,
     if adapter is not None:
         readout = getattr(adapter, "readout", None)
         if readout is not None:
-            entry = readout(stream.unsqueeze(0)).squeeze(0)
+            # R runs at the member's CARRIER dtype and the payload comes
+            # back in the stream's — the same two port casts the diagonal
+            # route applies (protocol.readout_at_port).  What re-enters
+            # the span has to be the stream's dtype: the host's own
+            # layers are the model's.
+            carrier = carrier_dtype_of(adapter)
+            h_in = stream if (carrier is None
+                              or carrier is stream.dtype) \
+                else stream.to(carrier)
+            entry = readout(h_in.unsqueeze(0)).squeeze(0).to(stream.dtype)
 
     layer_kwargs = layer_kwargs or {}
     piped = entry

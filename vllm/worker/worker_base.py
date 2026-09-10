@@ -311,7 +311,15 @@ class WorkerBase:
             source = spec.get("adapters", {}).get(layer_idx,
                                                    spec["sample_adapter"])
             model_dtype = torch.bfloat16
-            adapter_copy = _prepare_adapter(source, dev, model_dtype)
+            # Same carrier rule as every other route: the record's
+            # declaration wins, the member's class / parameters answer
+            # when it is silent, and a member whose carrier can be
+            # neither declared nor derived is refused by name.
+            adapter_copy = _prepare_adapter(
+                source, dev, model_dtype,
+                carrier_dtype=adapter_config.get("carrier_dtype"),
+                label=f"id={adapter_int_id} at site={site} "
+                      f"(L{layer_idx})")
             _add_adapter_to_layer(layer, adapter_int_id, adapter_copy,
                                   position, dev, site=site)
             count += 1

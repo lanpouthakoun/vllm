@@ -16,7 +16,15 @@ __all__ = [
     "SUPPORTED_WRITE_LABELS",
     "MULTISITE_HONOURS_UNCHUNKED_PREFILL",
     "SERVING_REQUIREMENT_ATTRS",
+    "CARRIER_DTYPE_ATTR",
+    "CARRIER_DTYPE_STAMP",
+    "CarrierDtypeUnknown",
     "declared_serving_requirements",
+    "declared_carrier_dtype",
+    "resolve_carrier_dtype",
+    "stamp_carrier_dtype",
+    "carrier_dtype_of",
+    "readout_at_port",
     "apply_adaptation",
     "apply_write",
     "readout_then_write",
@@ -273,6 +281,249 @@ def declared_serving_requirements(adaptation: nn.Module) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# The member's CARRIER DTYPE — what the stream is, INSIDE the member
+# ---------------------------------------------------------------------------
+# A member is mounted in a host that runs at ONE dtype (bf16, here).  It
+# does not follow that the member computes at that dtype.  The HF side
+# has always allowed a member to run its own port in fp32 inside a bf16
+# host — ``campaign/state_tracking_transfer/dichotomy/members.py``'s
+# ``Fp32Stream`` is exactly that and nothing else::
+#
+#     def readout(self, fx, state=None, x=None):
+#         return self.leaf.readout(fx.float(), state, x).to(fx.dtype)
+#
+# cast the stream UP at the port, run the leaf, cast the payload back
+# DOWN at the port.  The dtype in the middle is the member's CARRIER
+# DTYPE: a property of the member, not of the host.
+#
+# This engine used to have no name for it.  ``layer._prepare_adapter``
+# cast every ``nn.Linear`` in a mounted member to the MODEL's dtype and
+# called ``readout`` on the raw bf16 stream — so an fp32 member landed
+# with bf16 weights and an fp32-casting body, and the first matmul died
+# with ``expected mat1 and mat2 to have the same dtype, but got: float
+# != c10::BFloat16`` (campaign/serving/parity_headline, job 312676, the
+# S5 ``ext`` member: admitted, exported bit-for-bit, baked route, then
+# this).  A member that happens to PIN its own parameters (the faithful
+# native members' ``_apply``) survived that cast only by undoing it.
+#
+# So the carrier dtype is named, carried and applied:
+#
+#   * the serving record DECLARES it (``adapters.mounting.save_members``
+#     writes ``carrier_dtype`` per record; ``adapters.serving`` derives
+#     it from the checkpoint's own parameter dtype when the member's
+#     class does not say), and it rides ``adapter_config`` to both
+#     routes;
+#   * a member's CLASS may declare it directly
+#     (``serving_carrier_dtype``) — which is how a member whose
+#     parameters are fp32 but whose PORT is bf16 (the faithful native
+#     members: fp32 mixer math, bf16 carrier, cast back at the fusion)
+#     says so;
+#   * failing both, it is DERIVED from the member's own floating-point
+#     parameters, which must be unanimous;
+#   * and if it can be neither declared nor derived, the member is
+#     REFUSED BY NAME rather than served through a guessed cast.
+#
+# Nothing else in this engine up- or down-casts a member: the weights
+# are left exactly as the checkpoint had them, and the ONLY casts are
+# the two at the port.
+# The name is the LIBRARY's, imported for the same reason the site table
+# is: a member declares its carrier once, and the fork must not keep a
+# second copy of what that declaration is called.  The fallback is only
+# for a library predating the axis, which by definition has no member
+# that declares one.
+try:
+    from adapters._base import CARRIER_DTYPE_ATTR
+except ImportError:  # pragma: no cover - depends on library age
+    CARRIER_DTYPE_ATTR = "serving_carrier_dtype"
+
+#: where the resolved dtype is stamped on a prepared member, so the
+#: per-token hot path does not re-derive it (and so a refusal happens at
+#: LOAD time, not inside a forward).
+CARRIER_DTYPE_STAMP = "_adapter_carrier_dtype"
+
+_CARRIER_UNSET = object()
+
+
+class CarrierDtypeUnknown(RuntimeError):
+    """A member's carrier dtype can be neither declared nor derived.
+
+    Raised by name, with the member in it.  Serving on regardless would
+    mean picking a cast for it — which is the silent numeric change this
+    whole surface exists to make impossible."""
+
+
+def _as_torch_dtype(value) -> Optional["torch.dtype"]:
+    """``torch.float32`` / ``"float32"`` / ``"torch.float32"`` -> dtype."""
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return value
+    name = str(value).split(".")[-1]
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise CarrierDtypeUnknown(
+            f"{value!r} is not a torch dtype: a carrier dtype is declared "
+            f"as a torch.dtype or its name (e.g. 'float32', 'bfloat16').")
+    return dtype
+
+
+def declared_carrier_dtype(adaptation: nn.Module) -> Optional["torch.dtype"]:
+    """The carrier dtype *adaptation*'s CLASS declares, or ``None``.
+
+    Composites (``adaptation.members``) are recursed and must AGREE: a
+    declaration does not disappear by being wrapped, and two members
+    that want different ports cannot share one.
+    """
+    if adaptation is None:
+        return None
+    found = set()
+    own = getattr(adaptation, CARRIER_DTYPE_ATTR, None)
+    if own is not None:
+        found.add(_as_torch_dtype(own))
+    for member in (getattr(adaptation, "members", None) or ()):
+        sub = declared_carrier_dtype(member)
+        if sub is not None:
+            found.add(sub)
+    if not found:
+        return None
+    if len(found) > 1:
+        raise CarrierDtypeUnknown(
+            f"REFUSING to serve {type(adaptation).__name__}: its members "
+            f"declare DIFFERENT carrier dtypes "
+            f"({sorted(str(d) for d in found)}) through "
+            f"{CARRIER_DTYPE_ATTR!r}. One composite has one port; there "
+            f"is no cast that is right for both.")
+    return found.pop()
+
+
+def _parameter_dtypes(adaptation: nn.Module) -> set:
+    """The floating-point parameter dtypes *adaptation* itself holds.
+
+    A shared view (``adapters.serving._SharedServingView``) keeps its
+    core as a PLAIN attribute so per-layer views do not duplicate the
+    parameters — ``nn.Module.parameters()`` never reaches it — so it is
+    walked explicitly.  Buffers are deliberately NOT consulted: a
+    bookkeeping buffer's dtype is not what the member's matmuls run in.
+
+    A COMPOSITE's own parameters exclude its members'.  A composite is
+    not one computation at one port: ``layer._blend_one_adaptation``
+    applies each member under its own mask, so each is cast at the port
+    in its own right and two members may legitimately carry different
+    dtypes.  Folding theirs in here would refuse exactly that.
+    """
+    out = set()
+    members = getattr(adaptation, "members", None) or ()
+    owned_by_members = {id(p) for m in members for p in m.parameters()}
+    for p in adaptation.parameters():
+        if p.is_floating_point() and id(p) not in owned_by_members:
+            out.add(p.dtype)
+    core = getattr(adaptation, "core", None)
+    if isinstance(core, nn.Module):
+        for p in core.parameters():
+            if p.is_floating_point():
+                out.add(p.dtype)
+    return out
+
+
+def resolve_carrier_dtype(adaptation: nn.Module,
+                          declared=None,
+                          label: Optional[str] = None,
+                          ) -> Optional["torch.dtype"]:
+    """*adaptation*'s carrier dtype: declared, else derived, else refused.
+
+    Args:
+        adaptation: the member.
+        declared: what the SERVING RECORD says (``adapter_config``'s
+            ``carrier_dtype``), if anything.  The record wins, because
+            it was written from the checkpoint that the weights came
+            from.
+        label: the member's name, for the refusal.
+
+    Returns ``None`` for a member with no floating-point parameters at
+    all — it has no carrier of its own, so it simply runs in the
+    stream's dtype and NOTHING is cast.  That is the absence of a cast,
+    not a guessed one.
+    """
+    if declared is not None:
+        return _as_torch_dtype(declared)
+    own = declared_carrier_dtype(adaptation)
+    if own is not None:
+        return own
+    dtypes = _parameter_dtypes(adaptation)
+    if not dtypes:
+        return None
+    if len(dtypes) == 1:
+        return dtypes.pop()
+    raise CarrierDtypeUnknown(
+        f"REFUSING to serve {label or type(adaptation).__name__}: its "
+        f"CARRIER DTYPE cannot be established. The member's class does "
+        f"not declare {CARRIER_DTYPE_ATTR!r}, the serving record carries "
+        f"no 'carrier_dtype', and its own floating-point parameters are "
+        f"NOT unanimous ({sorted(str(d) for d in dtypes)}), so there is "
+        f"no dtype the stream can be cast to at the port. The engine "
+        f"casts the stream to the member's carrier at F_in and the "
+        f"payload back at F_out and does not up- or down-cast anywhere "
+        f"else; picking one of these dtypes would silently change what "
+        f"this member computes. Declare "
+        f"{CARRIER_DTYPE_ATTR} = '<dtype>' on the leaf class, or export "
+        f"the member with a 'carrier_dtype' in its serving record "
+        f"(adapters.mounting.save_members).")
+
+
+def stamp_carrier_dtype(adaptation: nn.Module,
+                        declared=None,
+                        label: Optional[str] = None,
+                        ) -> Optional["torch.dtype"]:
+    """Resolve *adaptation*'s carrier dtype and record it ON the member.
+
+    Called once, at LOAD time, so the refusal lands where a human is
+    looking (``load_adapter`` / engine construction) instead of inside a
+    forward, and so the per-token path is a plain attribute read.
+    Composite members are stamped individually — each is applied at the
+    port in its own right (``layer._blend_one_adaptation``).
+    """
+    for member in (getattr(adaptation, "members", None) or ()):
+        stamp_carrier_dtype(member, declared=declared, label=label)
+    carrier = resolve_carrier_dtype(adaptation, declared=declared,
+                                    label=label)
+    object.__setattr__(adaptation, CARRIER_DTYPE_STAMP, carrier)
+    return carrier
+
+
+def carrier_dtype_of(adaptation: nn.Module) -> Optional["torch.dtype"]:
+    """The carrier dtype of a mounted member, as the hot path reads it.
+
+    Uses the stamp left by ``stamp_carrier_dtype`` when there is one and
+    resolves (and stamps) on first use otherwise — the legacy in-process
+    registry path installs members without going through
+    ``_prepare_adapter``.
+    """
+    stamped = getattr(adaptation, CARRIER_DTYPE_STAMP, _CARRIER_UNSET)
+    if stamped is not _CARRIER_UNSET:
+        return stamped
+    return stamp_carrier_dtype(adaptation)
+
+
+def readout_at_port(adaptation: nn.Module,
+                    h_in: torch.Tensor) -> torch.Tensor:
+    """R_phi at F_in, run in the member's carrier dtype.
+
+    The two casts of ``Fp32Stream``, and only those two: the stream goes
+    IN as the member's carrier and the payload comes back OUT in the
+    stream's own dtype, so ``write`` (W_phi at F_out) is always applied
+    with both of its arguments in the stream's dtype.
+    """
+    carrier = carrier_dtype_of(adaptation)
+    stream_dtype = h_in.dtype
+    if carrier is not None and carrier is not stream_dtype:
+        h_in = h_in.to(carrier)
+    payload = adaptation.readout(h_in)
+    if payload.dtype is not stream_dtype:
+        payload = payload.to(stream_dtype)
+    return payload
+
+
 def readout_then_write(adaptation: nn.Module,
                        hidden: torch.Tensor) -> torch.Tensor:
     """The DIAGONAL (F_in == F_out) form of the two-step contract.
@@ -280,8 +531,14 @@ def readout_then_write(adaptation: nn.Module,
     One port, so the stream the member reads is the stream it writes:
     ``write(h, readout(h))``.  With the default W this is exactly
     ``readout(h)``, which is what this engine did before the W axis.
+
+    R runs at the member's CARRIER dtype and its payload comes back in
+    the stream's dtype (``readout_at_port``), so W is applied in the
+    stream's dtype on both arguments — bit-identical to the old path for
+    a member whose carrier IS the stream's dtype, which is every member
+    that ever served before the carrier axis existed.
     """
-    return apply_write(adaptation, hidden, adaptation.readout(hidden))
+    return apply_write(adaptation, hidden, readout_at_port(adaptation, hidden))
 
 
 def port_order(layer_idx: int, site: str) -> tuple:
@@ -316,6 +573,13 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
     applied against the same stream R read — ``write(h, readout(h))``,
     which for the default W (a replacement) is exactly ``readout(h)``.
 
+    The member runs at its own CARRIER dtype: the stream is cast to it
+    on the way in and the payload cast back on the way out
+    (``readout_at_port``), so the blend, the write and the mask are all
+    in the STREAM's dtype.  A member whose carrier is the stream's dtype
+    — every member that served before this axis existed — takes exactly
+    the same arithmetic it took before, with no cast at all.
+
     Args:
         adaptation: The adaptation module.
         hidden: ``(num_tokens, dim)`` stream at the mount site.
@@ -327,9 +591,14 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
                           dtype=torch.float32)
     apply_masked = getattr(adaptation, "apply_masked", None)
     if apply_masked is not None:
+        # A member that blends itself still reads and writes the stream
+        # at the port, so the port casts are the same two.
+        carrier = carrier_dtype_of(adaptation)
+        if carrier is not None and carrier is not hidden.dtype:
+            return apply_masked(hidden.to(carrier), mask).to(hidden.dtype)
         return apply_masked(hidden, mask)
     h3d = hidden.unsqueeze(0)
-    out = apply_write(adaptation, h3d, adaptation.readout(h3d)).squeeze(0)
+    out = readout_then_write(adaptation, h3d).squeeze(0)
     correction = out - hidden
     return hidden + correction * mask.unsqueeze(-1).to(correction.dtype)
 
