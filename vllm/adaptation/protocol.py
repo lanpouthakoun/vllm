@@ -58,7 +58,8 @@ _PAIR_PORT_IMPORT_ERROR: Optional[str] = None
 try:
     from adapters.sites import PORT_ORDER, WRITE_PORTS  # noqa: F401
     from adapters.sites import port_order as _shared_port_order
-    from adapters.sites import validate_write_port as _shared_validate_write_port
+    from adapters.sites import \
+        validate_write_port as _shared_validate_write_port
     HAVE_PAIR_PORTS = True
 except ImportError as _pair_e:  # pragma: no cover - depends on library age
     PORT_ORDER = None  # type: ignore[assignment]

@@ -15,7 +15,6 @@ re-executed pass keeps its OWN cache, and that a cached decode step
 reproduces the full-prefix forward through the span.
 """
 
-import copy
 import math
 from types import SimpleNamespace
 
@@ -144,7 +143,8 @@ class FakeDecoderLayer(nn.Module):
 
     def forward(self, positions, hidden_states, residual):
         self.forwards += 1
-        stream = hidden_states if residual is None else hidden_states + residual
+        stream = (hidden_states if residual is None else
+                  hidden_states + residual)
         mid = stream + self.self_attn.attn(positions, stream)
         out = mid + 0.5 * torch.tanh(self.mlp(mid))
         # Deferred-residual contract: hidden + residual == out.
@@ -449,7 +449,8 @@ class TestRefusals:
     def test_non_block_output_input_port_is_refused(self):
         cfg = _pipe_config()
         cfg["site"] = "post_attn"
-        with pytest.raises(RuntimeError, match="input port .* not implemented"):
+        with pytest.raises(RuntimeError,
+                           match="input port .* not implemented"):
             R.plan_from_adapter_config(cfg, NLAYERS)
 
     def test_multiple_input_layers_are_refused(self):
@@ -616,7 +617,8 @@ class TestNumerics:
 
     def _base_and_piped(self, gate, passes=2, in_layer=2, out_layer=0,
                         seed=1, tokens=5):
-        x = torch.randn(tokens, HIDDEN, generator=torch.Generator().manual_seed(9))
+        gen = torch.Generator().manual_seed(9)
+        x = torch.randn(tokens, HIDDEN, generator=gen)
         positions = torch.arange(tokens)
 
         model_b, layers_b = _build_stack(seed)
