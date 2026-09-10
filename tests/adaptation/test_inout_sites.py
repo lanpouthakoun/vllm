@@ -1158,6 +1158,103 @@ class TestLibraryLeafParity:
 # 6. Regression: the diagonal path is untouched
 # ---------------------------------------------------------------------------
 
+class TestWriteCapabilitySurface:
+    """The engine DECLARES which W_phi labels it applies.
+
+    ``SUPPORTED_WRITE_LABELS`` is not documentation: the library's
+    serving builder probes it (``adapters/serving.py::
+    refuse_custom_write``) and refuses a member whose W is not in it,
+    BY NAME, before an engine is built.  That makes the set a promise in
+    both directions, and both halves are pinned here:
+
+      * every label in the set is a write this engine really applies
+        (asserted by running it through ``run_recirculation``);
+      * a label out of the set is one no route here can execute — ``add``
+        and ``norm_mix`` are the FORWARD and CARRY pipes' writes, and
+        neither route exists, so claiming them would send a member down
+        a path that computes a different function fluently.
+    """
+
+    def _recirculate(self, leaf, seed=47, tokens=4, in_layer=2, passes=2):
+        model, layers = _build_stack(5, InPlaceDecoderLayer)
+        cfg = _pipe_config(in_layer=in_layer, out_layer=0, passes=passes,
+                           leaf=leaf)
+        mounted = _mount(layers, cfg, in_layer)
+        _install(model, layers, cfg)
+        stream = torch.randn(tokens, HIDDEN,
+                             generator=torch.Generator().manual_seed(seed))
+        STORE.reset()
+        with torch.no_grad():
+            out = R.run_recirculation(layers[in_layer],
+                                      torch.arange(tokens), stream,
+                                      mounted, None, {})
+        return stream, out
+
+    def test_the_surface_is_where_the_library_probes_it(self):
+        """One name, reachable from the module that owns the write port."""
+        assert R.SUPPORTED_WRITE_LABELS is P.SUPPORTED_WRITE_LABELS
+        assert "SUPPORTED_WRITE_LABELS" in R.__all__
+        assert isinstance(P.SUPPORTED_WRITE_LABELS, frozenset)
+        assert all(isinstance(x, str) for x in P.SUPPORTED_WRITE_LABELS)
+
+    def test_replace_is_declared_and_applied(self):
+        """The default W: a leaf with no ``write`` at all."""
+        assert "replace" in P.SUPPORTED_WRITE_LABELS
+        stream, out = self._recirculate(BarePipe())
+        assert not torch.equal(out, stream), \
+            "the declared default write did not install the payload"
+
+    def test_interpolate_is_declared_and_applied(self):
+        """InterpolateWrite's gate: identity at 0, live above it."""
+        assert "interpolate" in P.SUPPORTED_WRITE_LABELS
+        stream, out = self._recirculate(GatedPipe(gate=0.0))
+        assert torch.equal(out, stream)
+        stream, out = self._recirculate(GatedPipe(gate=0.9))
+        assert not torch.allclose(out, stream, atol=1e-6)
+
+    def test_the_missing_routes_writes_are_not_claimed(self):
+        """``add`` and ``norm_mix`` belong to routes that do not exist.
+
+        AddWrite deposits a delta at a LATER port (forward pipe) and
+        NormMixWrite needs a unit direction carried from a source port
+        across decode steps (carry pipe).  Nothing here transports a
+        payload between ports, so both must stay unclaimed until the
+        commit that implements their route adds them.
+        """
+        assert not ({"add", "norm_mix"} & P.SUPPORTED_WRITE_LABELS)
+
+    def test_the_labels_are_the_librarys_own_names(self):
+        """The set is written in the LIBRARY's vocabulary, since that is
+        what the probing side compares against (``write_label_of``)."""
+        base = pytest.importorskip("adapters._base")
+        assert base.write_label_of(BarePipe()) == "replace"
+        leaf = pytest.importorskip(
+            "adapters.types.recirculation").RecirculationAdapter(
+                hidden_size=HIDDEN, loop_start=0, loop_end=2, passes=2,
+                gated=True, layer_idx=0)
+        if not hasattr(leaf, "write"):
+            pytest.skip("installed adapters library predates the W axis")
+        assert base.write_label_of(leaf) == "interpolate"
+        assert base.write_label_of(leaf) in P.SUPPORTED_WRITE_LABELS
+
+    def test_a_leaf_whose_label_is_unclaimed_is_still_refused_by_name(self):
+        """The surface must be able to NAME the write it will not serve —
+        an unclaimed label is a specific string, not a boolean."""
+        base = pytest.importorskip("adapters._base")
+
+        class LowRankWrite(base.StatelessAdapter):
+
+            def readout(self, fx, state=None, x=None):
+                return fx
+
+            def write(self, h_out, payload):
+                return h_out + payload
+
+        label = base.write_label_of(LowRankWrite())
+        assert label == "low_rank_write"
+        assert label not in P.SUPPORTED_WRITE_LABELS
+
+
 class TestDiagonalRegression:
 
     def test_diagonal_member_output_is_unchanged_by_the_new_code_path(self):

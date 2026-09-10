@@ -91,14 +91,20 @@ from typing import Any, Optional
 import torch
 from torch import nn
 
-from vllm.adaptation.protocol import (apply_write, port_order,
-                                      require_pair_ports, validate_site,
-                                      validate_write_port)
+from vllm.adaptation.protocol import (SUPPORTED_WRITE_LABELS, apply_write,
+                                      port_order, require_pair_ports,
+                                      validate_site, validate_write_port)
 
 logger = logging.getLogger("vllm.adaptation.recirculation")
 
 __all__ = [
     "REWIRE_KEYS",
+    # Re-exported so the library's serving builder has ONE name to probe
+    # for "which W_phi does the installed fork apply?" — the write port
+    # this module owns is where a non-default W actually lands.  The
+    # definition (and the reasoning for what is in the set) lives next
+    # to apply_write in vllm/adaptation/protocol.py.
+    "SUPPORTED_WRITE_LABELS",
     "RecircPlan",
     "config_rewires",
     "install_recirculation",

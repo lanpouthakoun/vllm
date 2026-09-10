@@ -13,6 +13,7 @@ __all__ = [
     "PORT_ORDER",
     "WRITE_PORTS",
     "HAVE_PAIR_PORTS",
+    "SUPPORTED_WRITE_LABELS",
     "apply_adaptation",
     "apply_write",
     "readout_then_write",
@@ -157,6 +158,46 @@ def apply_write(adaptation: nn.Module, h_out: torch.Tensor,
         return _shared_apply_write(adaptation, h_out, payload)
     write = getattr(adaptation, "write", None)
     return payload if write is None else write(h_out, payload)
+
+
+# ---------------------------------------------------------------------------
+# The capability surface for W_phi
+# ---------------------------------------------------------------------------
+# The W labels this engine APPLIES at a write port.  This is a
+# capability surface, not documentation: the library's serving builder
+# probes it (adapters/serving.py::refuse_custom_write) and refuses, at
+# checkpoint-load time and by name, a member whose W this engine does
+# not serve — instead of the blanket "any non-default W" refusal it had
+# to use while the engine hard-coded W = replace.
+#
+# Why a WHITELIST and not "whatever the leaf defines".  apply_write
+# duck-types ``leaf.write(h_out, payload)``, so mechanically it would
+# run any write at all; what the engine cannot check from inside that
+# call is whether the ``payload`` it assembled is the one that write was
+# written for.  The labels below are exactly the ones whose payload
+# contract this engine satisfies and whose numerics the suite pins
+# (tests/adaptation/test_inout_sites.py::TestWriteCapabilitySurface):
+#
+#   ``replace``      the default W — ``BaseAdapter.write`` returns the
+#                    payload unchanged, which is every member that
+#                    predates the W axis, and the bare pipe.
+#   ``interpolate``  ``InterpolateWrite``'s gated mix,
+#                    ``h + g*(payload - h)``: the re-executing pipe's
+#                    gate, bit-exact identity at g = 0.
+#
+# ``add`` and ``norm_mix`` are deliberately ABSENT, and not because
+# ``h_out + payload`` is hard.  Each is the write of a ROUTE this engine
+# does not have.  ``AddWrite`` is a FORWARD pipe's write: it deposits a
+# delta at a LATER port, and nothing here carries a payload from one
+# layer's hook to another's.  ``NormMixWrite`` needs ``payload`` to be a
+# unit direction produced at the source port of a CARRY pipe, which
+# needs the per-request state slot the fork deliberately does not have
+# (docs/recirculation-serving.md §5 in the adapters repo).  Running
+# either against a payload assembled the way THIS engine assembles it
+# would compute a different function, fluently and without an error —
+# the exact failure the W axis exists to make loud.  A route that grows
+# adds its label here in the same commit that implements it.
+SUPPORTED_WRITE_LABELS = frozenset({"replace", "interpolate"})
 
 
 def readout_then_write(adaptation: nn.Module,

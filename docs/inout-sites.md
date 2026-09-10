@@ -66,17 +66,18 @@ start  = i         if out_site == "block_input"    # resume AT layer i
        = i + 1     if out_site == "block_output"   # resume after layer i
 span   = layers[start .. j]                        # inclusive both ends
 piped  = (L_j ∘ … ∘ L_start)^k ( R(h_j) )
-h_j'   = recombine(h_j, piped)
+h_j'   = write(h_j, piped)
 ```
 
 and the host continues at layer `j+1` with `h_j'`. `R` is the member's
-`readout` (the identity for a pipe) and `recombine` is an optional
-duck-typed callback:
+`readout` (the identity for a pipe) and `write` is its own W_phi
+(`adapters/_base.py`; this was a private `recombine` callback until
+2026-09-10 and a leaf still carrying that hook is now refused):
 
-- absent → `piped` (the bare pipe replaces the stream);
-- gated → `fx + g·(piped − fx)`, which is **`fx` bit for bit at `g = 0`**
-  while `dout/dg|₀ = piped − fx ≠ 0`. An exact no-op at init that is not
-  a saddle.
+- default `write` → `piped` (the bare pipe replaces the stream);
+- `InterpolateWrite` → `fx + g·(piped − fx)`, which is **`fx` bit for bit
+  at `g = 0`** while `dout/dg|₀ = piped − fx ≠ 0`. An exact no-op at init
+  that is not a saddle.
 
 The span's total execution count per token is therefore `1 + k`: the
 host's own pass plus `k` re-executions. Members mounted *inside* the span
@@ -94,7 +95,7 @@ identical to the host's own pass. The recirculated stream is a different
 The span always runs on the whole batch — it is a schedule, not a
 per-token computation — and the member's ordinary combined phase ∧
 membership mask then selects which tokens keep the recirculated value:
-`h + mask·(recombine(h, piped) − h)`. This reuses the fork's existing
+`h + mask·(write(h, piped) − h)`. This reuses the fork's existing
 mask machinery unchanged.
 
 ---
@@ -253,9 +254,22 @@ baseline an order of magnitude above the HF path.
 - Per-pass KV registration for the span's attention layers, one extra set
   per pass, declared before the spec is frozen.
 - Span re-execution in the input layer's own forward, `passes` times,
-  with the member's `readout` on the way in and `recombine` on the way
-  out, for **prefill and decode alike** — the per-pass caches persist
-  across steps exactly as the host's do.
+  with the member's `readout` on the way in and its own `write` (W_phi)
+  on the way out, for **prefill and decode alike** — the per-pass caches
+  persist across steps exactly as the host's do.
+- **A capability surface for W_phi.**
+  `vllm.adaptation.protocol.SUPPORTED_WRITE_LABELS` (re-exported as
+  `vllm.adaptation.recirculation.SUPPORTED_WRITE_LABELS`) names the
+  writes this engine applies — `replace` and `interpolate` — in the
+  library's own vocabulary (`adapters._base.write_label_of`). The
+  library's serving builder probes it and refuses an unserved W *by
+  name* at checkpoint-load time (`adapters/serving.py::
+  refuse_custom_write`) instead of refusing every non-default W. It is a
+  whitelist on purpose: `apply_write` would duck-type any leaf's
+  `write`, but `add` and `norm_mix` are the FORWARD and CARRY pipes'
+  writes and neither route exists here, so a payload assembled the way
+  this engine assembles it is not the payload they expect. A route that
+  grows adds its label in the same commit.
 - Both residual contracts: llama-style
   `(positions, hidden, residual) -> (hidden, residual)` and the
   residual-free olmo2-style `(positions, hidden) -> hidden`. The host's
@@ -268,7 +282,7 @@ baseline an order of magnitude above the HF path.
   starts) and every `RMSNorm(x, residual)` after that is
   `ops.fused_add_rms_norm`, which writes the running residual sum back
   into that very tensor. The stream handed to the span is the host
-  layer's own `h_full` — both `recombine`'s `fx` and the value the layer
+  layer's own `h_full` — both the write's `h_out` and the value the layer
   re-bases its deferred residual on — so `_run_span_once` copies before
   the first layer touches it. Without the copy the gate-0 pipe silently
   replaced the host's block output with the span's first intermediate:
