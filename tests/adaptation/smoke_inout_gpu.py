@@ -305,9 +305,14 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--max-num-seqs", type=int, default=64)
     # Three engines are built in sequence and an HF model is loaded after
-    # them; keep each one's share small enough that an imperfect teardown
-    # cannot starve the next build.
-    ap.add_argument("--gpu-memory-utilization", type=float, default=0.35)
+    # them.  Tearing an engine down does NOT give the memory back (vLLM keeps
+    # the VllmConfig, and with it every Attention layer and its KV cache, in
+    # process-global state), so each engine keeps its whole share for the rest
+    # of the run: budget for 3u + the HF model <= 1, and for the third build
+    # to still see u free, i.e. u <= 0.33.  0.25 leaves ~20 GiB for the HF
+    # baseline and is still ~16 GiB of KV per engine, far more than the
+    # 64 seqs x 2048 tokens x 24 layers (~6.4 GiB) this test can use.
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.25)
     ap.add_argument("--hf-batch-size", type=int, default=8)
     ap.add_argument("--repeat", type=int, default=8,
                     help="repeat the prompt list this many times for the "
