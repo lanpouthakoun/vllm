@@ -341,15 +341,33 @@ def main() -> int:
     results: dict[str, bool] = {}
 
     # ---- base (no adapter) reference generation ---------------------
+    # The throughput comparison against the base has to be LIKE FOR LIKE
+    # or it means nothing: the same prompt list, the same max_tokens, the
+    # same max_num_seqs, and a warmup generate() on BOTH engines.  (An
+    # earlier version compared the base's cold 8-prompt reference run
+    # against the pipe's warm 64-prompt run and reported the ratio as the
+    # pipe's cost, which measured batch size and engine warmup, not the
+    # pipe.)
+    many = prompts * args.repeat
     base_ids = base_texts = None
-    base_tokens = base_dt = None
+    base_tp_tokens = base_tp_dt = None
     if phases & {"identity", "throughput"}:
         _log("building the BASE engine (no adapter) ...")
         llm = _build_llm(args)
+        _generate(llm, prompts[:2], 8)  # warm up
         base_ids, base_texts, base_tokens, base_dt = _generate(
             llm, prompts, args.max_tokens)
-        _log(f"base: {base_tokens} tokens in {base_dt:.2f}s "
+        _log(f"base reference: {base_tokens} tokens in {base_dt:.2f}s "
              f"({base_tokens / base_dt:.1f} tok/s)")
+        if "throughput" in phases:
+            _log(f"base throughput: {len(many)} prompts x "
+                 f"{args.max_tokens} new tokens, "
+                 f"max_num_seqs={args.max_num_seqs}")
+            _, _, base_tp_tokens, base_tp_dt = _generate(
+                llm, many, args.max_tokens)
+            _log(f"base route: {base_tp_tokens} tokens in "
+                 f"{base_tp_dt:.2f}s "
+                 f"({base_tp_tokens / base_tp_dt:.1f} tok/s)")
         llm = _free_engine(llm)
 
     # ---- gate 0: KV allocation + bit-exact identity ------------------
@@ -403,31 +421,41 @@ def main() -> int:
                 _log(f"  sample pipe: {texts[0][:100]!r}")
 
         if "throughput" in phases:
-            many = prompts * args.repeat
-            _log(f"throughput: {len(many)} prompts x {args.max_tokens} "
-                 f"new tokens, max_num_seqs={args.max_num_seqs}")
+            _log(f"pipe throughput: {len(many)} prompts x "
+                 f"{args.max_tokens} new tokens, "
+                 f"max_num_seqs={args.max_num_seqs}")
             _generate(llm, prompts[:2], 8)  # warm up
             _, _, vllm_tokens, vllm_dt = _generate(llm, many, args.max_tokens)
             _log(f"vLLM route: {vllm_tokens} tokens in {vllm_dt:.2f}s "
                  f"({vllm_tokens / vllm_dt:.1f} tok/s)")
+            # Reported here, not inside the HF-baseline try block: this
+            # ratio is the engine-side cost and must survive an HF
+            # failure.
+            if base_tp_dt:
+                base_tps = base_tp_tokens / base_tp_dt
+                pipe_tps = vllm_tokens / vllm_dt
+                span = args.loop_end - args.loop_start + 1
+                predicted = (num_layers + args.passes * span) / num_layers
+                _log(f"cost of the pipe vs the unadapted vLLM base, same "
+                     f"workload ({len(many)} prompts x {args.max_tokens} "
+                     f"tokens, both warmed up): {base_tps:.1f} -> "
+                     f"{pipe_tps:.1f} tok/s = {base_tps / pipe_tps:.2f}x "
+                     f"slower; predicted ~{predicted:.2f}x from "
+                     f"(L + passes*|span|)/L = ({num_layers} + "
+                     f"{args.passes}*{span})/{num_layers}, plus the "
+                     f"smaller KV budget")
         llm = _free_engine(llm)
 
     # ---- HF loop baseline -------------------------------------------
     if "throughput" in phases:
         try:
             _log("running the HF-loop baseline ...")
-            hf_tokens, hf_dt = _hf_baseline(args, prompts * args.repeat)
+            hf_tokens, hf_dt = _hf_baseline(args, many)
             _log(f"HF loop:    {hf_tokens} tokens in {hf_dt:.2f}s "
                  f"({hf_tokens / hf_dt:.1f} tok/s)")
             if vllm_dt:
                 speedup = (vllm_tokens / vllm_dt) / (hf_tokens / hf_dt)
                 _log(f"SPEEDUP vLLM route vs HF loop: {speedup:.2f}x")
-                if base_dt:
-                    cost = (base_tokens / base_dt) / (vllm_tokens / vllm_dt)
-                    _log(f"cost of the pipe vs the unadapted vLLM base: "
-                         f"{cost:.2f}x slower "
-                         f"(expected ~1 + passes*|span|/layers of extra "
-                         f"compute, plus the smaller KV budget)")
         except Exception as e:  # noqa: BLE001
             _log(f"HF baseline failed ({type(e).__name__}: {e}); the vLLM "
                  f"numbers above still stand")
