@@ -43,6 +43,18 @@ import os
 import sys
 import time
 
+# Run EngineCore in this process instead of a child.  Two reasons, both
+# fatal with the default forked EngineCore:
+#   * this script touches CUDA in the parent before the first engine (the
+#     ``torch.cuda.is_available()`` guard in main(), and
+#     ``torch.cuda.empty_cache()`` in _free_engine between engines), so a
+#     forked child dies in torch's _lazy_init with "Cannot re-initialize
+#     CUDA in forked subprocess";
+#   * the pipe spec carries a live ``nn.Module`` leaf through
+#     ``adapter_config``, which wants to stay in the process that built it.
+# Must be set before ``vllm.envs`` is first read, hence module scope.
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
 import torch
 
 DEFAULT_PROMPTS = [
