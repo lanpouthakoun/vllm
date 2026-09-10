@@ -1101,9 +1101,11 @@ def _multi_adapter_forward(
         mask_buf = layer_self._adapter_combined_masks.get(recirc_id)
         num_tokens = new_stream.shape[0]
         mask = mask_buf[:num_tokens] if mask_buf is not None else None
+        recirc_key = str(recirc_id)
         new_stream = run_recirculation(
             layer_self, positions, new_stream,
-            layer_self.served_adapters.get(str(recirc_id)),
+            layer_self.served_adapters[recirc_key]
+            if recirc_key in layer_self.served_adapters else None,
             mask, layer_kwargs)
 
     if residual is None:
