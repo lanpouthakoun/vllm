@@ -73,20 +73,36 @@ def _log(msg: str) -> None:
     print(f"[inout-smoke] {msg}", flush=True)
 
 
-def _free_engine(llm) -> None:
-    """Best-effort teardown so the next engine can have the GPU."""
+def _reclaim(tag: str = "") -> None:
+    """Collect, drop the caching allocator's blocks, and report the GPU."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+        _log(f"GPU free {free / 2 ** 30:.1f}/{total / 2 ** 30:.1f} GiB{tag}")
+
+
+def _free_engine(llm):
+    """Best-effort teardown so the next engine can have the GPU.
+
+    Always returns None, and MUST be called as ``llm = _free_engine(llm)``:
+    the EngineCore runs in this process, so the caller's own name is what
+    pins the model weights and the KV cache.  ``del llm`` inside here would
+    only drop the parameter.  The actual reclaim happens in _build_llm(),
+    once the caller's reference is gone.
+    """
+    try:
+        llm.llm_engine.engine_core.shutdown()
+    except Exception as e:  # noqa: BLE001
+        _log(f"engine shutdown warning (non-fatal): {e}")
     try:
         from vllm.distributed.parallel_state import (
             destroy_distributed_environment, destroy_model_parallel)
-        del llm
-        gc.collect()
         destroy_model_parallel()
         destroy_distributed_environment()
     except Exception as e:  # noqa: BLE001
         _log(f"teardown warning (non-fatal): {e}")
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    return None
 
 
 def _make_spec(args, hidden_size: int, gate: float):
@@ -120,6 +136,7 @@ def _make_spec(args, hidden_size: int, gate: float):
 
 def _build_llm(args, adapter_config=None):
     from vllm import LLM
+    _reclaim(" before build")
     kwargs = dict(
         model=args.model,
         dtype=args.dtype,
@@ -287,7 +304,10 @@ def main() -> int:
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--max-num-seqs", type=int, default=64)
-    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    # Three engines are built in sequence and an HF model is loaded after
+    # them; keep each one's share small enough that an imperfect teardown
+    # cannot starve the next build.
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.35)
     ap.add_argument("--hf-batch-size", type=int, default=8)
     ap.add_argument("--repeat", type=int, default=8,
                     help="repeat the prompt list this many times for the "
@@ -325,7 +345,7 @@ def main() -> int:
             llm, prompts, args.max_tokens)
         _log(f"base: {base_tokens} tokens in {base_dt:.2f}s "
              f"({base_tokens / base_dt:.1f} tok/s)")
-        _free_engine(llm)
+        llm = _free_engine(llm)
 
     # ---- gate 0: KV allocation + bit-exact identity ------------------
     if phases & {"kv", "identity"}:
@@ -355,7 +375,7 @@ def main() -> int:
                         _log(f"    pipe: {texts[i][:120]!r}")
                         break
             _log(f"pipe@g=0: {n} tokens in {dt:.2f}s ({n / dt:.1f} tok/s)")
-        _free_engine(llm)
+        llm = _free_engine(llm)
 
     # ---- gate != 0: the span must actually reach the output ----------
     vllm_tokens = vllm_dt = None
@@ -385,7 +405,7 @@ def main() -> int:
             _, _, vllm_tokens, vllm_dt = _generate(llm, many, args.max_tokens)
             _log(f"vLLM route: {vllm_tokens} tokens in {vllm_dt:.2f}s "
                  f"({vllm_tokens / vllm_dt:.1f} tok/s)")
-        _free_engine(llm)
+        llm = _free_engine(llm)
 
     # ---- HF loop baseline -------------------------------------------
     if "throughput" in phases:
