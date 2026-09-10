@@ -552,8 +552,22 @@ class _ShadowSwap:
 
 def _run_span_once(installed: "_InstalledRecirc", positions, stream,
                    layer_kwargs: dict):
-    """One pass of the span, threading the (hidden, residual) contract."""
-    hidden, residual = stream, None
+    """One pass of the span, threading the (hidden, residual) contract.
+
+    *stream* is COPIED before the span touches it.  A real decoder layer
+    keeps no promise about the tensor it is handed: llama's aliases it as
+    ``residual`` when it is called with ``residual=None`` (which is how a
+    pass starts), and every ``RMSNorm(x, residual)`` after that is
+    ``ops.fused_add_rms_norm``, which writes the running residual sum
+    back into that very tensor.  The caller's ``stream`` is the host
+    layer's ``h_full`` — the value ``recombine`` must see as ``fx`` and
+    the value the layer re-bases its own deferred residual on — so
+    letting the span write through it silently replaces the host's own
+    block output with the span's first intermediate, and a gate of 0
+    stops being a no-op.  One (num_tokens, dim) copy per pass, against
+    ``span_len`` layer executions.
+    """
+    hidden, residual = stream.clone(), None
     for layer in installed.span:
         if getattr(type(layer), "_adapter_has_residual_arg", True):
             hidden, residual = layer(positions, hidden, residual,

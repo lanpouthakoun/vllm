@@ -54,7 +54,8 @@ checks that a diagonal config carries none of the pair keys, that
 explicit `None`s stay diagonal, and
 `TestDiagonalRegression` checks that a plain `block_output` member's
 output is unchanged with the new code path present. The whole existing
-suite is unchanged: **292 passed / 25 skipped**, from 237 / 24 before.
+suite still passes: `tests/adaptation` is **310 passed / 24 skipped**
+with the pair axis present, from 237 / 24 before it existed.
 
 ### Semantics
 
@@ -217,10 +218,26 @@ above), and that penalty is applied to a throughput that is already an
 order of magnitude above the HF loop's — so the route is far faster than
 the HF path while being meaningfully slower than the unadapted engine.
 
-**This is a mechanism argument, not a measurement.** The measurement is
+**The argument above is a mechanism argument.** The measurement is
 `tests/adaptation/smoke_inout_gpu.py`, which reports vLLM tok/s, HF-loop
-tok/s, their ratio, and the pipe's cost against the unadapted base. No
-number is claimed here until that script has run on the cluster.
+tok/s, their ratio, and the pipe's cost against the unadapted base on
+the **same** workload with both engines warmed up.
+
+Measured, Llama-3.2-1B-Instruct on one H100-80GB, span `0..3`, `k = 2`,
+64 prompts × 64 new tokens, `max_num_seqs=64`, `gpu_memory_utilization
+0.25`, eager, no prefix caching (Slurm job 310307):
+
+| | tok/s |
+|---|---|
+| unadapted vLLM base | 9187 |
+| the pipe (gate 0.25) | 6454 |
+| HF loop driving the same recirculation | 456 |
+
+So the pipe costs **1.42×** against the unadapted engine — against a
+predicted 1.50× from `(L + k·S)/L = (16 + 2·4)/16` — and is **14.2×**
+faster than the HF loop. The shape §3 predicted is what the run shows:
+a modest constant factor against the engine's own baseline, on top of a
+baseline an order of magnitude above the HF path.
 
 ---
 
@@ -245,16 +262,32 @@ number is claimed here until that script has run on the cluster.
   extra per-layer kwargs are replayed verbatim on every pass.
 - Re-entrancy safety: depth guard, and `layer_name`/`kv_cache` restored on
   exception.
+- **The span gets a private copy of the stream.** A real decoder layer
+  keeps no promise about the tensor it is handed: llama's aliases it as
+  `residual` when called with `residual=None` (which is how each pass
+  starts) and every `RMSNorm(x, residual)` after that is
+  `ops.fused_add_rms_norm`, which writes the running residual sum back
+  into that very tensor. The stream handed to the span is the host
+  layer's own `h_full` — both `recombine`'s `fx` and the value the layer
+  re-bases its deferred residual on — so `_run_span_once` copies before
+  the first layer touches it. Without the copy the gate-0 pipe silently
+  replaced the host's block output with the span's first intermediate:
+  bit-exact identity on an out-of-place mock, wrong tokens on a GPU.
+  Pinned by `TestGateZeroIsANoOpOnADestructiveStack`, which runs the
+  identity assertion over **both** an out-of-place and an in-place
+  decoder mock, across prefill and explicit decode steps.
 - Engine-config policy for a rewiring config, reusing the guards the fork
   already had for sequence-mixing members: `enforce_eager=True`,
   `enable_chunked_prefill=False` with `max_num_batched_tokens ≥
   max_model_len`, and `enable_prefix_caching=False`.
 
-Tests: 55 CPU tests in `tests/adaptation/test_inout_sites.py`, including
+Tests: 73 CPU tests in `tests/adaptation/test_inout_sites.py`, including
 cached-decode-equals-full-forward for prefill ∈ {1, 3, 6} × passes ∈
 {1, 2} **with a negative control** that collapsing the per-pass caches
 onto one name breaks it — so the assertion tests the separation and not
-the mock.
+the mock — and gate-0 identity across prefill + decode steps on both
+residual contracts, with a negative control that the in-place mock
+really does clobber the tensor it is handed.
 
 ---
 

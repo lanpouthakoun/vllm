@@ -151,6 +151,66 @@ class FakeDecoderLayer(nn.Module):
         return out - mid, mid
 
 
+def _rms_norm(x, weight, eps=1e-6):
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    return x * torch.rsqrt(var + eps) * weight
+
+
+def _fused_add_rms_norm(x, residual, weight, eps=1e-6):
+    """The semantics of ``ops.fused_add_rms_norm``: BOTH args in place.
+
+    ``vllm/model_executor/layers/layernorm.py::RMSNorm.forward_cuda``
+    calls it whenever ``residual is not None`` (which is every layer of
+    a llama stack after the first), and it writes the sum back into
+    ``residual`` and the normalised value back into ``x``.  Nothing in
+    the real engine hands a layer a stream tensor it is allowed to keep.
+    """
+    residual.add_(x)
+    x.copy_(_rms_norm(residual, weight, eps))
+    return x, residual
+
+
+class InPlaceDecoderLayer(nn.Module):
+    """``FakeDecoderLayer``'s twin under vLLM's REAL residual contract.
+
+    ``LlamaDecoderLayer.forward`` aliases ``residual = hidden_states``
+    when it is handed ``residual=None``, and then every
+    ``RMSNorm(x, residual)`` call overwrites that tensor in place.  So a
+    caller that hands the stack a tensor and expects to still own its
+    values afterwards is wrong on the GPU even though it is right
+    against an out-of-place mock — which is exactly the blind spot that
+    let a gate-0 pipe stop being a no-op on the engine while
+    ``FakeDecoderLayer`` said it was one.
+    """
+
+    _adapter_has_residual_arg = True
+
+    def __init__(self, config, cache_config=None, quant_config=None,
+                 prefix: str = ""):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = nn.Module()
+        self.self_attn.attn = FakeAttention(f"{prefix}.self_attn.attn")
+        self.mlp = nn.Linear(HIDDEN, HIDDEN, bias=False)
+        self.w_in = nn.Parameter(torch.rand(HIDDEN) + 0.5)
+        self.w_post = nn.Parameter(torch.rand(HIDDEN) + 0.5)
+        self.forwards = 0
+
+    def forward(self, positions, hidden_states, residual):
+        self.forwards += 1
+        if residual is None:
+            residual = hidden_states  # ALIAS, exactly as llama.py does
+            hidden_states = _rms_norm(hidden_states, self.w_in)
+        else:
+            hidden_states, residual = _fused_add_rms_norm(
+                hidden_states, residual, self.w_in)
+        hidden_states = self.self_attn.attn(positions, hidden_states)
+        hidden_states, residual = _fused_add_rms_norm(
+            hidden_states, residual, self.w_post)
+        hidden_states = 0.5 * torch.tanh(self.mlp(hidden_states))
+        return hidden_states, residual
+
+
 class GatedPipe(nn.Module):
     """The recirculation member: identity T, identity R, gated recombine.
 
@@ -176,9 +236,9 @@ class GatedPipe(nn.Module):
 # Fixtures: a stack of adapter-wrapped fake layers + a fake VllmConfig
 # ---------------------------------------------------------------------------
 
-def _build_stack(seed: int = 0):
+def _build_stack(seed: int = 0, layer_cls=FakeDecoderLayer):
     torch.manual_seed(seed)
-    cls = make_adapter_decoder_layer(FakeDecoderLayer)
+    cls = make_adapter_decoder_layer(layer_cls)
     layers = [cls(_Cfg(), None, None, f"model.layers.{i}")
               for i in range(NLAYERS)]
     model = nn.Module()
@@ -785,6 +845,121 @@ class TestDecodeConsistency:
         b = _run(model, layers, y, positions)
 
         torch.testing.assert_close(a[:-1], b[:-1], atol=0, rtol=0)
+
+
+def _prefill_then_decode(model, layers, x, prefill):
+    """Prefill ``prefill`` tokens, then step the rest one at a time.
+
+    Each step is handed a FRESH tensor, as the engine's embedding lookup
+    is: a real decoder layer overwrites the stream it is given.
+    """
+    total = x.shape[0]
+    positions = torch.arange(total)
+    STORE.reset()
+    with torch.no_grad():
+        outs = [_run(model, layers, x[:prefill].clone(),
+                     positions[:prefill])]
+        for t in range(prefill, total):
+            outs.append(_run(model, layers, x[t:t + 1].clone(),
+                             positions[t:t + 1]))
+    return torch.cat(outs, dim=0)
+
+
+class TestGateZeroIsANoOpOnADestructiveStack:
+    """Identity at ``g = 0`` against a stack that reuses its buffers.
+
+    ``TestNumerics::test_zero_gate_is_bit_exact_identity`` already pins
+    identity on ``FakeDecoderLayer``, which is out of place: it never
+    writes to the tensors it is handed, so a span that keeps a reference
+    to the caller's stream looks harmless.  The GPU does not work that
+    way (see :class:`InPlaceDecoderLayer`), and it showed: the smoke's
+    ``identity_at_gate_0`` failed on a real Llama while all 56 CPU tests
+    passed.  These run the same assertion over BOTH contracts, and over
+    explicit decode steps rather than prefill alone.
+    """
+
+    def _pipe_stack(self, layer_cls, passes, gate=0.0, in_layer=2,
+                    out_layer=0, seed=5):
+        model, layers = _build_stack(seed, layer_cls)
+        cfg = _pipe_config(in_layer=in_layer, out_layer=out_layer,
+                           passes=passes, gate=gate)
+        _mount(layers, cfg, in_layer)
+        _install(model, layers, cfg)
+        return model, layers
+
+    @pytest.mark.parametrize("layer_cls",
+                             [FakeDecoderLayer, InPlaceDecoderLayer])
+    @pytest.mark.parametrize("prefill", [1, 3, 6])
+    @pytest.mark.parametrize("passes", [1, 2])
+    def test_identity_through_prefill_and_decode(self, layer_cls, prefill,
+                                                 passes):
+        """Bit-exact against the UNADAPTED stack at every decode step."""
+        total = 8
+        x = torch.randn(total, HIDDEN,
+                        generator=torch.Generator().manual_seed(23))
+
+        model, layers = self._pipe_stack(layer_cls, passes)
+        piped = _prefill_then_decode(model, layers, x, prefill)
+
+        ref_model, ref_layers = _build_stack(5, layer_cls)
+        ref = _prefill_then_decode(ref_model, ref_layers, x, prefill)
+
+        assert piped.shape == ref.shape
+        assert torch.equal(piped, ref), (
+            "gate 0 is not a no-op: first differing step at token "
+            f"{int((piped != ref).any(dim=-1).nonzero()[0])}")
+
+    @pytest.mark.parametrize("layer_cls",
+                             [FakeDecoderLayer, InPlaceDecoderLayer])
+    def test_the_span_does_not_keep_the_stream_it_was_handed(self,
+                                                             layer_cls):
+        """``recombine``'s ``fx`` must be the PRE-pipe stream.
+
+        A real decoder layer keeps no promise about the tensor it is
+        given: llama's aliases it as ``residual`` and every
+        ``fused_add_rms_norm`` writes the running sum back into it.  Hand
+        the span the caller's tensor and ``fx`` is already the span's own
+        intermediate by the time ``recombine`` sees it, so ``g = 0``
+        returns the wrong value AND the layer's own re-based residual is
+        wrong for every later layer.
+        """
+        model, layers = self._pipe_stack(layer_cls, 2)
+        stream = torch.randn(4, HIDDEN,
+                             generator=torch.Generator().manual_seed(29))
+        before = stream.clone()
+        positions = torch.arange(4)
+        with torch.no_grad():
+            out = R.run_recirculation(layers[2], positions, stream,
+                                      layers[2].served_adapters["1"], None,
+                                      {})
+        assert torch.equal(stream, before), \
+            "the span overwrote the caller's stream in place"
+        assert torch.equal(out, before), \
+            "gate 0 must hand back fx bit for bit"
+
+    def test_the_negative_control_really_is_destructive(self):
+        """Guards the mock: ``InPlaceDecoderLayer`` must actually clobber
+        the tensor it is handed, or the two tests above prove nothing."""
+        model, layers = _build_stack(5, InPlaceDecoderLayer)
+        stream = torch.randn(3, HIDDEN,
+                             generator=torch.Generator().manual_seed(31))
+        before = stream.clone()
+        with torch.no_grad():
+            layers[0](torch.arange(3), stream, None)
+        assert not torch.equal(stream, before)
+
+    @pytest.mark.parametrize("passes", [1, 2])
+    def test_a_nonzero_gate_still_moves_the_stream(self, passes):
+        """The fix must not turn the pipe into a no-op at every gate."""
+        total = 6
+        x = torch.randn(total, HIDDEN,
+                        generator=torch.Generator().manual_seed(23))
+        model, layers = self._pipe_stack(InPlaceDecoderLayer, passes,
+                                         gate=0.5)
+        piped = _prefill_then_decode(model, layers, x, 3)
+        ref_model, ref_layers = _build_stack(5, InPlaceDecoderLayer)
+        ref = _prefill_then_decode(ref_model, ref_layers, x, 3)
+        assert not torch.allclose(piped, ref, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
