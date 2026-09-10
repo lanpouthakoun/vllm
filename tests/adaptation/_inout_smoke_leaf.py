@@ -13,8 +13,8 @@ adapters library, which owns the member zoo; the smoke script prefers it
 when the installed library has it and falls back to this.  Both satisfy
 the same tiny engine contract:
 
-    readout(fx)          -> the stream handed INTO the span (identity)
-    recombine(fx, piped) -> the stream handed on after it
+    readout(fx)              -> the payload handed INTO the span (identity)
+    write(h_out, payload)    -> the stream handed on after it (W_phi)
 """
 
 from typing import Optional
@@ -24,7 +24,7 @@ import torch.nn as nn
 
 
 class GatedPipe(nn.Module):
-    """Identity transition, identity readout, gated recombine.
+    """Identity transition, identity readout, gated W_phi.
 
     ``out = fx + g*(piped - fx)``.  At ``g == 0`` this is ``fx`` bit for
     bit — the zero-init contract — while ``dout/dg|_0 = piped - fx`` is
@@ -71,11 +71,15 @@ class GatedPipe(nn.Module):
         unchanged.  The engine supplies the re-execution."""
         return fx
 
-    def recombine(self, fx, piped):
-        """Engine callback after the span has been re-executed."""
+    def write(self, h_out, payload):
+        """W_phi at the write port, after the span has been re-executed.
+
+        The gate is the member's WRITE, not an engine callback: the
+        engine calls ``write(h_out, payload)`` at F_out and nowhere else
+        (docs/recirculation-serving.md §1.1)."""
         if not self.gated:
-            return piped
-        return fx + self.gate.to(fx.dtype) * (piped - fx)
+            return payload
+        return h_out + self.gate.to(h_out.dtype) * (payload - h_out)
 
 
 def make_pipe_spec(hidden_size: int, loop_start: int, loop_end: int,

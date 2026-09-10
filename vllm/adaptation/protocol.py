@@ -14,6 +14,8 @@ __all__ = [
     "WRITE_PORTS",
     "HAVE_PAIR_PORTS",
     "apply_adaptation",
+    "apply_write",
+    "readout_then_write",
     "check_adaptation_supported",
     "port_order",
     "resolve_site_submodule_path",
@@ -94,6 +96,80 @@ def validate_write_port(site: str) -> None:
     _shared_validate_write_port(site)
 
 
+# ---------------------------------------------------------------------------
+# W_phi — the member's WRITE at F_out
+# ---------------------------------------------------------------------------
+# A member is <(T, R, W), F, P>.  R reads at F_in and never has the
+# stream at F_out in hand, so what the member does to that stream —
+# replace it, add to it, gate it, norm-match it — is its own fourth
+# method, ``write(h_out, payload)`` (adapters/_base.py::BaseAdapter.write,
+# docs/recirculation-serving.md §1.1).  The engine's job at the write
+# port is exactly::
+#
+#     payload = adaptation.readout(h_in, state)   # at F_in
+#     h_out   = adaptation.write(h_out, payload)  # at F_out
+#
+# The DEFAULT ``write`` returns the payload unchanged, so every member
+# that predates the W axis is byte-identical through this path (and the
+# ``adapted is hidden`` fast path still fires, because the default
+# returns the payload object itself).
+#
+# Prefer the library's own dispatch so the two sides cannot drift.  A
+# library predating the W axis has no member with a non-default W, so
+# the local fallback — which is the same duck-typed getattr — is exactly
+# right for it and cannot be wrong.
+try:
+    from adapters._base import apply_write as _shared_apply_write
+except ImportError:  # pragma: no cover - depends on library age
+    _shared_apply_write = None  # type: ignore[assignment]
+
+
+def apply_write(adaptation: nn.Module, h_out: torch.Tensor,
+                payload: torch.Tensor) -> torch.Tensor:
+    """W_phi(h_out, payload) -> the new stream at the write port.
+
+    Args:
+        adaptation: the mounted member.
+        h_out: the host's own stream at F_out, BEFORE the member writes.
+        payload: what the member produced at F_in (``readout``), carried
+            to the write port (for a backward pipe, after the span has
+            been re-executed over it).
+
+    Raises:
+        RuntimeError: if *adaptation* defines the RETIRED ``recombine``
+            hook.  ``recombine(fx, piped)`` was this engine's private
+            callback for the gated pipe until it became the member's
+            ``write``; a leaf still carrying it would have its gate
+            SILENTLY skipped here (gate 0 would stop being a no-op),
+            which is the exact failure this refusal exists to make loud.
+    """
+    if getattr(adaptation, "recombine", None) is not None:
+        raise RuntimeError(
+            f"{type(adaptation).__name__} defines the retired "
+            f"'recombine(fx, piped)' hook. The recombination at the "
+            f"write port is now the member's own W_phi: rename it to "
+            f"'write(self, h_out, payload)' (or inherit "
+            f"adapters._base.InterpolateWrite / AddWrite / NormMixWrite). "
+            f"The engine calls write() at F_out and nowhere else "
+            f"(docs/recirculation-serving.md §1.1); leaving 'recombine' "
+            f"in place would silently drop the gate.")
+    if _shared_apply_write is not None:
+        return _shared_apply_write(adaptation, h_out, payload)
+    write = getattr(adaptation, "write", None)
+    return payload if write is None else write(h_out, payload)
+
+
+def readout_then_write(adaptation: nn.Module,
+                       hidden: torch.Tensor) -> torch.Tensor:
+    """The DIAGONAL (F_in == F_out) form of the two-step contract.
+
+    One port, so the stream the member reads is the stream it writes:
+    ``write(h, readout(h))``.  With the default W this is exactly
+    ``readout(h)``, which is what this engine did before the W axis.
+    """
+    return apply_write(adaptation, hidden, adaptation.readout(hidden))
+
+
 def port_order(layer_idx: int, site: str) -> tuple:
     """Total order on residual ports across the stack (shared definition)."""
     require_pair_ports()
@@ -117,9 +193,14 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
 
     If the adaptation defines ``apply_masked(h, mask) -> h'`` that wins;
     otherwise the general interpolation blend runs:
-    ``lerp(h, R(h), mask)`` — written as ``h + mask*(R(h)-h)``. R is a
-    MAP, not a correction: replacement and multiplicative readouts are
-    first-class (mask=1 yields exactly R(h), whatever R is).
+    ``lerp(h, W(h, R(h)), mask)`` — written as ``h + mask*(out-h)``.
+    R is a MAP, not a correction: replacement and multiplicative
+    readouts are first-class (mask=1 yields exactly the member's value,
+    whatever R and W are).
+
+    This site is DIAGONAL (F_in == F_out), so the member's W_phi is
+    applied against the same stream R read — ``write(h, readout(h))``,
+    which for the default W (a replacement) is exactly ``readout(h)``.
 
     Args:
         adaptation: The adaptation module.
@@ -133,7 +214,8 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
     apply_masked = getattr(adaptation, "apply_masked", None)
     if apply_masked is not None:
         return apply_masked(hidden, mask)
-    out = adaptation.readout(hidden.unsqueeze(0)).squeeze(0)
+    h3d = hidden.unsqueeze(0)
+    out = apply_write(adaptation, h3d, adaptation.readout(h3d)).squeeze(0)
     correction = out - hidden
     return hidden + correction * mask.unsqueeze(-1).to(correction.dtype)
 

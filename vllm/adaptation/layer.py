@@ -62,12 +62,15 @@ def _nan_check_enabled() -> bool:
 
 
 def _readout_correction(adapter, h2d: torch.Tensor) -> torch.Tensor:
-    """R_phi spoken natively (v3 contract): a member's correction is
-    readout(h) - h. Phase masking blends h + mask * (R(h) - h) — exact
-    for additive members and the correct phase-gated blend for any R
-    (multiplicative readouts included). The additive _compute_delta
-    dialect is gone; leaves need only T/R."""
-    return (adapter.readout(h2d.unsqueeze(0)) - h2d.unsqueeze(0)).squeeze(0)
+    """R_phi and W_phi spoken natively: a member's correction at a
+    DIAGONAL site is ``write(h, readout(h)) - h``. Phase masking blends
+    ``h + mask * correction`` — exact for additive members and the
+    correct phase-gated blend for any R (multiplicative readouts
+    included). The additive _compute_delta dialect is gone; leaves need
+    only T/R/W, and the default W (a replacement) makes this exactly the
+    historical ``readout(h) - h``."""
+    h3d = h2d.unsqueeze(0)
+    return (readout_then_write(adapter, h3d) - h3d).squeeze(0)
 
 
 def _check_nan(tensor: torch.Tensor, label: str, layer_idx: int) -> bool:
@@ -262,6 +265,7 @@ from vllm.adaptation.positions import (PhaseInfo,  # noqa: E402
 from vllm.adaptation.protocol import (apply_adaptation,  # noqa: E402
                                       check_adaptation_supported,
                                       needs_sequence_segmentation,
+                                      readout_then_write,
                                       resolve_site_submodule_path,
                                       validate_site)
 

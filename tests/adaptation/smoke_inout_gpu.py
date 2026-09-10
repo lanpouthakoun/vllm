@@ -26,8 +26,9 @@ What it checks
    ``g = 0`` must be TOKEN-IDENTICAL to the unadapted model, even though
    the span really executed ``passes`` extra times.  This is the
    zero-init contract, and it is the single most informative check here:
-   it fails if the recombine is wrong, if the span corrupted the host's
-   KV cache, or if the stream was re-based incorrectly.
+   it fails if the member's write (W_phi) is wrong, if the span
+   corrupted the host's KV cache, or if the stream was re-based
+   incorrectly.
 3. **Effect at gate != 0** — the same prompts must NOT be token-identical
    once the gate is opened, or the span is not reaching the output.
 4. **Throughput** — tokens/s for the vLLM route vs the same computation

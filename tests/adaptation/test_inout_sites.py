@@ -4,7 +4,7 @@
 
 The site axis is a PAIR.  A mount whose output port PRECEDES its input
 port makes the engine re-execute the enclosed decoder layers ``passes``
-times from the write port, with the member's ``recombine`` folding the
+times from the write port, with the member's ``write`` (W_phi) folding the
 result back in.  See ``vllm/adaptation/recirculation.py`` and
 ``docs/inout-sites.md``.
 
@@ -212,10 +212,19 @@ class InPlaceDecoderLayer(nn.Module):
 
 
 class GatedPipe(nn.Module):
-    """The recirculation member: identity T, identity R, gated recombine.
+    """The recirculation member: identity T, identity R, gated W.
 
-    ``out = fx + g*(piped - fx)`` — bit-exact identity at ``g == 0``,
-    which is the zero-init contract the whole zoo rests on.
+    Mirrors ``adapters.types.recirculation.RecirculationAdapter``: R is
+    the identity (the pipe hands the stream to the write port unchanged)
+    and the gate lives in W_phi, the member's ``write`` —
+    ``out = h_out + g*(payload - h_out)``, bit-exact identity at
+    ``g == 0``, which is the zero-init contract the whole zoo rests on.
+    An ungated pipe uses the default W and returns the payload itself.
+
+    Keeping this mock on the LIVE contract is the point: it used to
+    define the engine's retired ``recombine`` hook, so every CPU test
+    here stayed green while the real library leaf — which had moved the
+    gate into ``write`` — had its gate silently dropped on GPU.
     """
 
     def __init__(self, gate: float = 0.0, gated: bool = True):
@@ -226,10 +235,50 @@ class GatedPipe(nn.Module):
     def readout(self, fx, state=None, x=None):
         return fx
 
-    def recombine(self, fx, piped):
+    def write(self, h_out, payload):
         if not self.gated:
-            return piped
-        return fx + self.gate.to(fx.dtype) * (piped - fx)
+            return payload
+        return h_out + self.gate.to(h_out.dtype) * (payload - h_out)
+
+
+# --- leaves for TestWriteContract -----------------------------------------
+# Module scope, not test-local: the baked route round-trips a member
+# through its blueprint (module + qualname), which only resolves for a
+# class importable from the module.
+
+class MarkedWritePipe(nn.Module):
+    """W is a marked, unmistakably non-default function.
+
+    Records what the engine handed it, and returns a constant, so a
+    caller that drops the write cannot accidentally look correct.
+    """
+
+    seen: dict = {}
+
+    def readout(self, fx, state=None, x=None):
+        return fx
+
+    def write(self, h_out, payload):
+        MarkedWritePipe.seen = {"h_out": h_out.clone(),
+                                "payload": payload.clone()}
+        return torch.full_like(h_out, 7.0)
+
+
+class BarePipe(nn.Module):
+    """No ``write`` at all: the default W (a replacement) must apply."""
+
+    def readout(self, fx, state=None, x=None):
+        return fx
+
+
+class OldContractPipe(nn.Module):
+    """A leaf still on the RETIRED ``recombine`` hook."""
+
+    def readout(self, fx, state=None, x=None):
+        return fx
+
+    def recombine(self, fx, piped):
+        return fx
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +312,14 @@ def _fake_vllm_config(adapter_config, *, prefix_caching=False,
 
 
 def _pipe_config(in_layer=3, out_layer=0, out_site="block_input", passes=2,
-                 gate=0.0, gated=True, position="all"):
-    """A baked adapter_config for a gated pipe, as serving.py would build."""
-    pipe = GatedPipe(gate=gate, gated=gated)
+                 gate=0.0, gated=True, position="all", leaf=None):
+    """A baked adapter_config for a gated pipe, as serving.py would build.
+
+    *leaf* substitutes another member for the default ``GatedPipe`` —
+    used to run the REAL library leaf, and leaves with a deliberately
+    marked W, through the same mount path.
+    """
+    pipe = GatedPipe(gate=gate, gated=gated) if leaf is None else leaf
     spec = {
         "layer_indices": [in_layer],
         "position": position,
@@ -710,7 +764,7 @@ class TestNumerics:
         assert not torch.allclose(k2, k3, atol=1e-6)
 
     def test_ungated_pipe_replaces_the_stream(self):
-        """An identity-recombine pipe hands the re-executed stream on
+        """A default-W (replace) pipe hands the re-executed stream on
         verbatim, so it must differ from the base."""
         x = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(3))
         positions = torch.arange(4)
@@ -913,13 +967,13 @@ class TestGateZeroIsANoOpOnADestructiveStack:
                              [FakeDecoderLayer, InPlaceDecoderLayer])
     def test_the_span_does_not_keep_the_stream_it_was_handed(self,
                                                              layer_cls):
-        """``recombine``'s ``fx`` must be the PRE-pipe stream.
+        """``write``'s ``h_out`` must be the PRE-pipe stream.
 
         A real decoder layer keeps no promise about the tensor it is
         given: llama's aliases it as ``residual`` and every
         ``fused_add_rms_norm`` writes the running sum back into it.  Hand
         the span the caller's tensor and ``fx`` is already the span's own
-        intermediate by the time ``recombine`` sees it, so ``g = 0``
+        intermediate by the time ``write`` sees it, so ``g = 0``
         returns the wrong value AND the layer's own re-based residual is
         wrong for every later layer.
         """
@@ -960,6 +1014,144 @@ class TestGateZeroIsANoOpOnADestructiveStack:
         ref_model, ref_layers = _build_stack(5, InPlaceDecoderLayer)
         ref = _prefill_then_decode(ref_model, ref_layers, x, 3)
         assert not torch.allclose(piped, ref, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 5b. W_phi: the recombination at the write port is the MEMBER's write
+# ---------------------------------------------------------------------------
+
+class TestWriteContract:
+    """The engine must apply the member's ``write`` at the write port.
+
+    This is the contract that broke once already.  The gated pipe's
+    interpolation used to be a private engine callback,
+    ``recombine(fx, piped)``, which the leaf implemented; the adapters
+    library then RETIRED it and moved the gate into the member's own
+    ``write`` (W_phi).  The engine kept duck-typing ``recombine``, found
+    nothing, and installed the re-executed stream unmixed — so gate 0
+    stopped being a no-op on a real model while every CPU test here
+    stayed green, because the mock leaf had not moved either.
+
+    The tests below pin both halves: the engine calls ``write``, and a
+    leaf still carrying the retired hook is refused LOUDLY instead of
+    having its gate silently dropped.
+    """
+
+    def _recirculate(self, leaf, seed=41, tokens=4, in_layer=2, passes=2):
+        model, layers = _build_stack(5, InPlaceDecoderLayer)
+        cfg = _pipe_config(in_layer=in_layer, out_layer=0, passes=passes,
+                           leaf=leaf)
+        mounted = _mount(layers, cfg, in_layer)
+        _install(model, layers, cfg)
+        stream = torch.randn(tokens, HIDDEN,
+                             generator=torch.Generator().manual_seed(seed))
+        STORE.reset()
+        with torch.no_grad():
+            out = R.run_recirculation(layers[in_layer],
+                                      torch.arange(tokens), stream,
+                                      mounted, None, {})
+        return stream, out
+
+    def test_the_engine_applies_the_members_write(self):
+        """A leaf whose W is a marked, non-default function must see it
+        applied — with the PRE-pipe stream as ``h_out``."""
+        MarkedWritePipe.seen = {}
+        stream, out = self._recirculate(MarkedWritePipe())
+        seen = MarkedWritePipe.seen
+        assert "h_out" in seen, "the engine never called write()"
+        assert torch.equal(seen["h_out"], stream), \
+            "write() must be handed the host's PRE-pipe stream as h_out"
+        assert not torch.equal(seen["payload"], stream), \
+            "the payload must be the RE-EXECUTED stream, not the input"
+        assert torch.equal(out, torch.full_like(stream, 7.0)), \
+            "the engine discarded the member's write and installed the pipe"
+
+    def test_a_gate_of_zero_is_an_identity_through_the_write(self):
+        leaf = GatedPipe(gate=0.0)
+        stream, out = self._recirculate(leaf)
+        assert torch.equal(out, stream), \
+            "gate 0 must hand back the pre-pipe stream bit for bit"
+
+    def test_a_leaf_without_a_write_gets_the_default_replacement(self):
+        """The default W returns the payload, so a bare pipe still hands
+        on the re-executed stream exactly as it did before the W axis."""
+        stream, out = self._recirculate(BarePipe())
+        assert not torch.equal(out, stream), \
+            "a bare pipe must still install the re-executed stream"
+
+    def test_the_retired_recombine_hook_is_refused_loudly(self):
+        """A leaf on the OLD contract must raise, not be quietly ignored.
+
+        Silently ignoring it is the exact regression this class exists
+        for: the member's gate would simply not happen and the model
+        would emit fluent output computing a different function.
+        """
+        with pytest.raises(RuntimeError, match="retired"):
+            self._recirculate(OldContractPipe())
+
+    def test_apply_write_refuses_the_retired_hook_on_every_route(self):
+        """The refusal lives at the single choke point, so the diagonal
+        route (protocol.apply_adaptation) is covered too."""
+        h = torch.randn(3, HIDDEN)
+        with pytest.raises(RuntimeError, match="retired"):
+            P.apply_adaptation(OldContractPipe(), h, None)
+
+
+class TestLibraryLeafParity:
+    """The engine against the REAL library leaf, not only the mock.
+
+    The mock drifting from ``adapters.types.recirculation`` is what let
+    the write-contract break ship: the mock kept the retired hook, so
+    the CPU suite could not see it.  Running the installed library leaf
+    through the same engine entry point closes that gap permanently.
+    """
+
+    def _leaf(self, gate):
+        A = pytest.importorskip(
+            "adapters.types.recirculation").RecirculationAdapter
+        leaf = A(hidden_size=HIDDEN, loop_start=0, loop_end=2, passes=2,
+                 gated=True, layer_idx=0)
+        if not hasattr(leaf, "write"):
+            pytest.skip("installed adapters library predates the W axis")
+        with torch.no_grad():
+            leaf.gate.fill_(gate)
+        return leaf
+
+    def _run_through_engine(self, leaf, seed=43, tokens=4):
+        model, layers = _build_stack(5, InPlaceDecoderLayer)
+        cfg = _pipe_config(in_layer=2, out_layer=0, passes=2, leaf=leaf)
+        mounted = _mount(layers, cfg, 2)
+        _install(model, layers, cfg)
+        stream = torch.randn(tokens, HIDDEN,
+                             generator=torch.Generator().manual_seed(seed))
+        STORE.reset()
+        with torch.no_grad():
+            out = R.run_recirculation(layers[2], torch.arange(tokens),
+                                      stream, mounted, None, {})
+        return stream, out
+
+    def test_the_library_leaf_is_an_identity_at_gate_zero(self):
+        """The CPU twin of the GPU smoke's ``identity_at_gate_0``."""
+        leaf = self._leaf(0.0)
+        stream, out = self._run_through_engine(leaf)
+        assert torch.equal(out, stream), (
+            "gate 0 is not a no-op for the library leaf: the engine is "
+            "not applying its write (W_phi)")
+
+    def test_the_library_leafs_gate_still_moves_the_stream(self):
+        """...and the identity is the gate's doing, not a dead pipe."""
+        leaf = self._leaf(0.9)
+        stream, out = self._run_through_engine(leaf)
+        assert not torch.allclose(out, stream, atol=1e-6)
+
+    def test_the_library_leaf_declares_a_non_default_write(self):
+        """Guards the two tests above: if the library leaf ever went back
+        to a default W they would pass for the wrong reason."""
+        leaf = self._leaf(0.0)
+        base = pytest.importorskip("adapters._base")
+        assert base.write_label_of(leaf) == "interpolate"
+        assert not hasattr(leaf, "recombine"), \
+            "library leaf still carries the retired hook"
 
 
 # ---------------------------------------------------------------------------

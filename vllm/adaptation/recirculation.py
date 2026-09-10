@@ -20,8 +20,10 @@ REWIRING.  The engine re-executes the enclosed decoder layers::
     span  = layers[start .. j]        # start = i for block_input,
                                       #         i+1 for block_output
     piped = (L_j o ... o L_start)^k ( R(h_j) )
-    h_j'  = recombine(h_j, piped)     # identity pipe: piped
-                                      # gated pipe:  h + g*(piped - h)
+    h_j'  = W(h_j, piped)             # the member's own write at F_out:
+                                      # bare pipe (default W): piped
+                                      # gated pipe (InterpolateWrite):
+                                      #     h + g*(piped - h)
 
 and the host then continues at layer j+1 with ``h_j'``.  This module
 implements that for the BAKED serving route (a single member baked into
@@ -89,8 +91,9 @@ from typing import Any, Optional
 import torch
 from torch import nn
 
-from vllm.adaptation.protocol import (port_order, require_pair_ports,
-                                      validate_site, validate_write_port)
+from vllm.adaptation.protocol import (apply_write, port_order,
+                                      require_pair_ports, validate_site,
+                                      validate_write_port)
 
 logger = logging.getLogger("vllm.adaptation.recirculation")
 
@@ -560,8 +563,8 @@ def _run_span_once(installed: "_InstalledRecirc", positions, stream,
     pass starts), and every ``RMSNorm(x, residual)`` after that is
     ``ops.fused_add_rms_norm``, which writes the running residual sum
     back into that very tensor.  The caller's ``stream`` is the host
-    layer's ``h_full`` — the value ``recombine`` must see as ``fx`` and
-    the value the layer re-bases its own deferred residual on — so
+    layer's ``h_full`` — the value the member's ``write`` must see as
+    ``h_out`` and the value the layer re-bases its deferred residual on — so
     letting the span write through it silently replaces the host's own
     block output with the span's first intermediate, and a gate of 0
     stops being a no-op.  One (num_tokens, dim) copy per pass, against
@@ -593,9 +596,10 @@ def run_recirculation(layer: nn.Module, positions, stream,
         stream: the residual stream at the input port,
             ``(num_tokens, dim)``.
         adapter: the mounted member.  Its ``readout`` (identity for a
-            pipe) is applied on the way in; its optional
-            ``recombine(fx, piped)`` mixes the result back — the gated
-            pipe's ``fx + g*(piped - fx)``, exactly ``fx`` at ``g == 0``.
+            pipe) is applied on the way in, producing the payload the
+            span re-executes; its ``write(h_out, payload)`` mixes the
+            result back at the write port — the gated pipe's
+            ``fx + g*(piped - fx)``, exactly ``fx`` at ``g == 0``.
         mask: the fork's per-token combined phase/membership mask, or
             ``None`` for all tokens.  The span always runs on the whole
             batch (it is a schedule, not a per-token computation); the
@@ -628,8 +632,18 @@ def run_recirculation(layer: nn.Module, positions, stream,
         installed.depth -= 1
 
     piped = piped.to(stream.dtype)
-    recombine = getattr(adapter, "recombine", None) if adapter else None
-    out = piped if recombine is None else recombine(stream, piped)
+    # The write port.  *stream* is the host's own value there (the
+    # PRE-pipe block output, which is why _run_span_once copies before
+    # the span can alias it) and *piped* is the member's payload, so the
+    # recombination is exactly W_phi: h_out <- write(h_out, payload).
+    # The gated pipe's InterpolateWrite makes that fx + g*(piped - fx),
+    # bit-exact fx at g == 0; the bare pipe's default W returns the
+    # payload, so an ungated pipe still hands on the re-executed stream
+    # unchanged.  (This used to call a private `recombine(fx, piped)`
+    # hook on the leaf; that hook is retired and apply_write refuses a
+    # leaf that still carries it rather than silently dropping its gate.)
+    out = apply_write(adapter, stream, piped) if adapter is not None \
+        else piped
     out = out.to(stream.dtype)
 
     if mask is None:
