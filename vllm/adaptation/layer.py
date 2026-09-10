@@ -1004,6 +1004,7 @@ def _multi_adapter_forward(
     residual,
     *,
     super_forward,
+    layer_kwargs: Optional[dict] = None,
 ):
     """Shared multi-adapter forward pass for Qwen2 and Llama layers.
 
@@ -1019,6 +1020,13 @@ def _multi_adapter_forward(
     ``linear:*`` adaptations run via forward hooks on submodules inside
     ``super_forward``; ``block_output`` adaptations run on the outgoing
     stream below.
+
+    Off-diagonal members (``F_out`` preceding ``F_in``, installed by
+    ``vllm.adaptation.recirculation``) run LAST, after the ordinary
+    block_output blend: the span is re-executed from the write port and
+    its result replaces the stream leaving this block.  ``layer_kwargs``
+    is the host's own extra per-layer kwargs, replayed verbatim on every
+    re-executed pass so the span sees an identical calling convention.
     """
     skip = (not hasattr(layer_self, "served_adapters")
             or len(layer_self.served_adapters) == 0
@@ -1065,16 +1073,38 @@ def _multi_adapter_forward(
     # the historical sum-of-masked-corrections whenever masks are disjoint
     # (which membership ∧ phase masks guarantee for paired adapters).
     adapter_sites = getattr(layer_self, "_adapter_adapter_sites", None)
+    # An off-diagonal member's readout is applied ON THE WAY INTO the
+    # span, not as a blend at this port, so it must not also run here —
+    # applying it twice would square a non-identity readout.
+    recirc = getattr(layer_self, "_adapter_recirc", None)
+    recirc_id = recirc.adapter_int_id if recirc is not None else None
     for str_id, adapter in layer_self.served_adapters.items():
         int_id = int(str_id)
         if active_ids is not None and int_id not in active_ids:
             continue
+        if int_id == recirc_id:
+            continue  # handled by the span re-execution below
         if (adapter_sites is not None
                 and adapter_sites.get(int_id, "block_output")
                 != "block_output"):
             continue  # mounted elsewhere (hooked submodule / block_input)
         new_stream = _blend_one_adaptation(layer_self, int_id, adapter,
                                            new_stream)
+
+    # Schedule rewiring: re-execute layers start..this one, `passes`
+    # times, from the stream leaving this block.  Runs after every
+    # same-port blend so the span is entered with the fully adapted
+    # stream, matching adapters.mounting._apply_leaf's ordering.
+    if recirc is not None and not recirc.depth and (
+            active_ids is None or recirc_id in active_ids):
+        from vllm.adaptation.recirculation import run_recirculation
+        mask_buf = layer_self._adapter_combined_masks.get(recirc_id)
+        num_tokens = new_stream.shape[0]
+        mask = mask_buf[:num_tokens] if mask_buf is not None else None
+        new_stream = run_recirculation(
+            layer_self, positions, new_stream,
+            layer_self.served_adapters.get(str(recirc_id)),
+            mask, layer_kwargs)
 
     if residual is None:
         # Residual-free contract: the adapted stream is the output.
@@ -1453,6 +1483,10 @@ def make_adapter_decoder_layer(base_layer_cls: type,
                 adapter=getattr(self, "adapter_adapter", None),
             )
 
+        # Which calling convention the span executor must use when it
+        # re-runs this layer (vllm/adaptation/recirculation.py).
+        _adapter_has_residual_arg = _has_residual_arg
+
         if _has_residual_arg:
 
             def forward(self, positions, hidden_states, residual, **kwargs):
@@ -1467,7 +1501,8 @@ def make_adapter_decoder_layer(base_layer_cls: type,
 
                 return _multi_adapter_forward(self, positions, hidden_states,
                                            residual,
-                                           super_forward=super_forward)
+                                           super_forward=super_forward,
+                                           layer_kwargs=kwargs)
         else:
 
             def forward(self, positions, hidden_states, **kwargs):
@@ -1481,7 +1516,8 @@ def make_adapter_decoder_layer(base_layer_cls: type,
 
                 out, _ = _multi_adapter_forward(self, positions, hidden_states,
                                              None,
-                                             super_forward=super_forward)
+                                             super_forward=super_forward,
+                                             layer_kwargs=kwargs)
                 return out
 
         def get_adapter_debug_stats(self) -> Optional[dict]:

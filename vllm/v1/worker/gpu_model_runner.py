@@ -2742,6 +2742,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         len(self._adapter_layers), self._adapter_builtin_adapter,
                         self.adapter_manager is not None)
 
+        # Off-diagonal (F_in != F_out) baked members re-execute a range of
+        # decoder layers, and every re-executed pass needs its OWN KV
+        # cache for that range.  This is the ONLY window in which those
+        # caches can still be declared: get_kv_cache_spec() below reads
+        # compilation_config.static_forward_context once, and the worker
+        # calls it right after load_model().  A no-op for every diagonal
+        # adapter and for an engine with no adapter at all.
+        from vllm.adaptation.recirculation import install_recirculation
+        self._adapter_recirc_plan = install_recirculation(
+            self.model, self.vllm_config)
+
         self.is_multimodal_pruning_enabled = (supports_multimodal_pruning(
             self.model) and self.model_config.multimodal_config.
                                               is_multimodal_pruning_enabled())

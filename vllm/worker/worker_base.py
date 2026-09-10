@@ -242,6 +242,12 @@ class WorkerBase:
         """
         if site == "block_output":
             site = adapter_config.get("site", "block_output")
+        # A schedule-rewiring member cannot arrive this way: the engine's
+        # KV-cache spec (and therefore the per-pass caches its span
+        # needs) was frozen before this RPC could run.  Refuse with the
+        # reason rather than serve a span that overwrites the host's K/V.
+        from vllm.adaptation.recirculation import refuse_rewired
+        refuse_rewired(adapter_config, "multisite")
         # Prompt-anchored positions silently break under an external
         # KV prefix — warn at load time (undetectable at mask time).
         from vllm.adaptation.layer import warn_if_prefix_incompatible_position

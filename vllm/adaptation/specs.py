@@ -42,6 +42,7 @@ __all__ = [
     "AdapterRequest",
     "adapter_config_to_spec",
     "adapter_config_needs_eager",
+    "adapter_config_rewires",
     "spec_to_adapter_config",
     # Deprecated global-state API (backward compat only):
     "set_adapter_spec",
@@ -172,7 +173,13 @@ def spec_to_adapter_config(adapter_spec: dict[str, Any]) -> dict[str, Any]:
             idx: _portable_state(a) for idx, a in adapters.items()
         }
 
-    # Pass through any extra keys (e.g. debug_mask)
+    # Pass through any extra keys (e.g. debug_mask, and the pair axis:
+    # site / output_site / output_layer / passes).  This is a plain
+    # pass-through ON PURPOSE — the pair keys are written by
+    # adapters.mounting.save_members ONLY when a mount actually rewires,
+    # so a diagonal member's spec carries none of them and its config is
+    # byte-identical to what this function produced before the pair axis
+    # existed.  See adapter_config_rewires().
     for k in adapter_spec:
         if k not in ("layer_indices", "position", "sample_adapter", "adapters"):
             config[k] = adapter_spec[k]
@@ -271,6 +278,20 @@ def adapter_config_needs_eager(adapter_config: Optional[dict[str, Any]],
             "adapter_config_needs_eager: could not inspect adapter_config "
             "(%s); leaving execution mode unchanged.", e)
         return False
+
+
+def adapter_config_rewires(adapter_config: Optional[dict[str, Any]],
+                           ) -> bool:
+    """Whether a baked ``adapter_config`` declares an off-diagonal site.
+
+    Re-exported from :mod:`vllm.adaptation.recirculation` so callers that
+    already import the spec helpers do not need a second import.  The
+    predicate is cheap and structural (no adapter reconstruction), which
+    is what lets the engine-config layer consult it before the model
+    exists.
+    """
+    from vllm.adaptation.recirculation import config_rewires
+    return config_rewires(adapter_config)
 
 
 # ---------------------------------------------------------------------------

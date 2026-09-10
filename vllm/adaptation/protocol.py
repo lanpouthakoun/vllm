@@ -10,10 +10,15 @@ import torch.nn as nn
 __all__ = [
     "MOUNT_SITES",
     "LINEAR_SITE_PREFIX",
+    "PORT_ORDER",
+    "WRITE_PORTS",
+    "HAVE_PAIR_PORTS",
     "apply_adaptation",
     "check_adaptation_supported",
+    "port_order",
     "resolve_site_submodule_path",
     "validate_site",
+    "validate_write_port",
 ]
 
 # Mount-site vocabulary: imported from the adapters library — the
@@ -33,6 +38,65 @@ except ImportError as _e:  # pragma: no cover
         "vllm.adaptation requires the 'adapters' library (the shared "
         "mount-site table, adapters.sites). Install it: "
         "pip install -e /path/to/adapters") from _e
+
+
+# ---------------------------------------------------------------------------
+# The site axis as a PAIR: (input port, output port)
+# ---------------------------------------------------------------------------
+# ``adapters.sites`` grew a total order on the residual-stream ports so a
+# mount can name an OUTPUT port distinct from (and preceding) its INPUT
+# port — the off-diagonal member the engine serves by re-executing the
+# enclosed decoder layers (see vllm/adaptation/recirculation.py).
+#
+# These names are NEWER than the site table itself, so they are imported
+# OPTIONALLY: a fork paired with a library predating the pair axis must
+# keep serving every diagonal (F_in == F_out) adapter exactly as before.
+# What it must NOT do is carry a private copy of the port order — that is
+# the silent-drift bug class the hard import above exists to kill — so
+# when the names are missing every entry point raises instead.
+_PAIR_PORT_IMPORT_ERROR: Optional[str] = None
+try:
+    from adapters.sites import PORT_ORDER, WRITE_PORTS  # noqa: F401
+    from adapters.sites import port_order as _shared_port_order
+    from adapters.sites import validate_write_port as _shared_validate_write_port
+    HAVE_PAIR_PORTS = True
+except ImportError as _pair_e:  # pragma: no cover - depends on library age
+    PORT_ORDER = None  # type: ignore[assignment]
+    WRITE_PORTS = None  # type: ignore[assignment]
+    _shared_port_order = None  # type: ignore[assignment]
+    _shared_validate_write_port = None  # type: ignore[assignment]
+    HAVE_PAIR_PORTS = False
+    _PAIR_PORT_IMPORT_ERROR = str(_pair_e)
+
+
+def require_pair_ports() -> None:
+    """Raise unless the installed adapters library defines the port order.
+
+    Called from every code path that reads a mount's ``output_site`` /
+    ``output_layer`` / ``passes``.  Diagonal mounts never reach it.
+    """
+    if HAVE_PAIR_PORTS:
+        return
+    raise ImportError(
+        "this adapter declares an output port distinct from its input "
+        "port (output_site/output_layer/passes), which needs the port "
+        "order from the adapters library: adapters.sites must export "
+        "WRITE_PORTS, PORT_ORDER, validate_write_port and port_order. "
+        "The installed adapters library does not "
+        f"({_PAIR_PORT_IMPORT_ERROR}). Upgrade the adapters library; the "
+        "fork deliberately keeps no private copy of the site/port table.")
+
+
+def validate_write_port(site: str) -> None:
+    """Raise unless *site* is a legal OUTPUT port (shared definition)."""
+    require_pair_ports()
+    _shared_validate_write_port(site)
+
+
+def port_order(layer_idx: int, site: str) -> tuple:
+    """Total order on residual ports across the stack (shared definition)."""
+    require_pair_ports()
+    return _shared_port_order(layer_idx, site)
 
 
 def resolve_site_submodule_path(site: str) -> Optional[str]:

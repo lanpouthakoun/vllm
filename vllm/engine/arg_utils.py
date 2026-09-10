@@ -1139,6 +1139,7 @@ class EngineArgs:
         # under the general-shape compile.  Force eager for the baked
         # route before compilation is configured.
         if self.adapter_config and not self.enforce_eager:
+            from vllm.adaptation.recirculation import config_rewires
             from vllm.adaptation.specs import adapter_config_needs_eager
             if adapter_config_needs_eager(self.adapter_config):
                 logger.warning(
@@ -1148,6 +1149,18 @@ class EngineArgs:
                     "segmentation and symbolic-shape chunk padding are "
                     "incompatible with CUDA graphs / general-shape "
                     "compilation).")
+                self.enforce_eager = True
+            elif config_rewires(self.adapter_config):
+                logger.warning(
+                    "adapter_config carries a schedule-rewiring "
+                    "adaptation (an output port preceding its input "
+                    "port); forcing enforce_eager=True. The engine "
+                    "re-executes a range of decoder layers `passes` "
+                    "times from inside that range's last layer, and "
+                    "swaps each attention module's layer_name between "
+                    "passes to reach that pass's KV cache — Python "
+                    "control flow that CUDA-graph capture and the "
+                    "general-shape compile both strip.")
                 self.enforce_eager = True
 
         device_config = DeviceConfig(
@@ -1592,17 +1605,36 @@ class EngineArgs:
         """
         if not self.adapter_config:
             return
+        from vllm.adaptation.recirculation import config_rewires
         from vllm.adaptation.specs import adapter_config_needs_eager
+        # A schedule-rewiring member needs whole-prompt prefill for a
+        # DIFFERENT reason than a scan: its per-pass KV caches persist
+        # across steps, so a second prefill chunk would attend to keys
+        # that pass p wrote for earlier chunks while its own queries came
+        # from the host's (un-recirculated) stream for this chunk.  Same
+        # remedy, so it rides the same policy.  Also force prefix caching
+        # off: a prefix-cache block is keyed by the token prefix alone
+        # and cannot distinguish the host's pass from the k extra ones.
+        rewires = config_rewires(self.adapter_config)
+        if rewires and self.enable_prefix_caching:
+            logger.warning(
+                "adapter_config carries a schedule-rewiring adaptation; "
+                "forcing enable_prefix_caching=False (prefix-cache "
+                "blocks are keyed by the token prefix, which does not "
+                "distinguish the host's own pass from the re-executed "
+                "passes that share the block table).")
+            self.enable_prefix_caching = False
         # Same predicate as the eager policy: does the baked config
         # carry a sequence-mixing member (composites recursed)?
-        if not adapter_config_needs_eager(self.adapter_config):
+        if not (rewires or adapter_config_needs_eager(self.adapter_config)):
             return
         needs_budget_raise = (
             self.max_num_batched_tokens is None
             or self.max_num_batched_tokens < model_config.max_model_len)
         if self.enable_chunked_prefill or needs_budget_raise:
             logger.warning(
-                "adapter_config carries a sequence-mixing adaptation; "
+                "adapter_config carries a sequence-mixing or "
+                "schedule-rewiring adaptation; "
                 "forcing unchunked prefill (enable_chunked_prefill="
                 "False, max_num_batched_tokens>=max_model_len=%d): "
                 "recurrent scan state does not carry across prefill "
