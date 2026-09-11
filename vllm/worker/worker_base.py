@@ -242,12 +242,32 @@ class WorkerBase:
         """
         if site == "block_output":
             site = adapter_config.get("site", "block_output")
-        # A schedule-rewiring member cannot arrive this way: the engine's
-        # KV-cache spec (and therefore the per-pass caches its span
-        # needs) was frozen before this RPC could run.  Refuse with the
-        # reason rather than serve a span that overwrites the host's K/V.
-        from vllm.adaptation.recirculation import refuse_rewired
-        refuse_rewired(adapter_config, "multisite")
+        # A schedule-rewiring member can arrive this way ONLY when the
+        # span it drives was RESERVED on EngineArgs.adapter_recirc_span
+        # before the engine existed — that reservation is what registered
+        # the per-pass KV caches, in the one window
+        # (gpu_model_runner.load_model, before get_kv_cache_spec) where
+        # they can still be declared.  fill_reserved_span binds this
+        # member to that span after checking its ports and passes against
+        # what was reserved, and REFUSES — naming the mismatch, or the
+        # absence of a reservation — rather than serving a span that
+        # overwrites the host's own K/V at the same slots.
+        from vllm.adaptation.recirculation import (config_rewires,
+                                                   fill_reserved_span,
+                                                   refuse_decode_state)
+        if config_rewires(adapter_config):
+            fill_reserved_span(self.get_model(), adapter_int_id,
+                               adapter_config)
+        # A member whose mount asked the ENGINE to carry a per-request
+        # State across decode steps (Mount.decode_state on a DIAGONAL
+        # mount).  This engine has no such state and declares so
+        # (protocol.CARRIES_ADAPTER_DECODE_STATE); serving it anyway runs
+        # R with state=None at every decoded position — the scan the
+        # member was trained as, silently replaced by a fresh-state
+        # singleton.  The library refuses first, on the same name; this
+        # is the re-check at the worker.
+        refuse_decode_state(adapter_config,
+                            label=f"id={adapter_int_id} at site={site}")
         # A member may DECLARE what the engine must be configured as
         # (unchunked prefill, eager) for its computation to be the one it
         # was trained as.  On this route the engine config was frozen

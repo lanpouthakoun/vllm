@@ -297,9 +297,10 @@ def _build_stack(seed: int = 0, layer_cls=FakeDecoderLayer):
 
 def _fake_vllm_config(adapter_config, *, prefix_caching=False,
                       chunked_prefill=False, eager=True, pp=1,
-                      kv_transfer=None):
+                      kv_transfer=None, recirc_span=None):
     return SimpleNamespace(
         adapter_config=adapter_config,
+        adapter_recirc_span=recirc_span,
         compilation_config=SimpleNamespace(static_forward_context={}),
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp,
                                         tensor_parallel_size=1),
@@ -600,13 +601,37 @@ class TestRefusals:
         with pytest.raises(RuntimeError, match=match):
             _install(model, layers, cfg, **kw)
 
-    def test_co_mounted_member_at_the_input_port_is_refused(self):
+    def test_co_mounted_member_at_the_input_port_is_ADMITTED(self):
+        """2026-09-11: this used to be a refusal ("a rewiring member must
+        be the only one at its input port, because ... the composition
+        order with a co-mounted member is undefined").  The order is now
+        DEFINED and declared — ``protocol.SPAN_COMOUNT_ORDER ==
+        "diagonal_then_span"``: every ordinary member at the port blends
+        first, in load order, and the span is entered with the blended
+        stream, which is exactly the HF engine's ordering with the
+        rewiring record last.  The span's driver stays the baked id=1.
+
+        This is what lets the composed member serve: its reader head is
+        mounted at ALL layers, including the span's input layer.
+        """
         model, layers = _build_stack()
         cfg = _pipe_config()
         _mount(layers, cfg, 3)
         _add_adapter_to_layer(layers[3], 2, GatedPipe(), "all",
                               torch.device("cpu"), site="block_output")
-        with pytest.raises(RuntimeError, match="must be the only one at its"):
+        plan, _ = _install(model, layers, cfg)
+        assert plan is not None
+        assert layers[3]._adapter_recirc.adapter_int_id == 1
+
+    def test_an_unidentifiable_span_driver_is_refused(self):
+        """Co-mounts are fine; an ambiguous DRIVER is not."""
+        model, layers = _build_stack()
+        cfg = _pipe_config()
+        _add_adapter_to_layer(layers[3], 2, GatedPipe(), "all",
+                              torch.device("cpu"), site="block_output")
+        _add_adapter_to_layer(layers[3], 3, GatedPipe(), "all",
+                              torch.device("cpu"), site="block_output")
+        with pytest.raises(RuntimeError, match="drives the span is ambiguous"):
             _install(model, layers, cfg)
 
     def test_install_is_a_no_op_without_a_rewiring_config(self):

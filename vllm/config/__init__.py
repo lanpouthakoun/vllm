@@ -140,6 +140,15 @@ class VllmConfig:
     """adapter configuration. Serializable blueprint dict that flows
     through LLM() → EngineArgs → VllmConfig → model constructors, replacing
     the old set_adapter_spec() global-state pattern. Multiprocess-safe."""
+    adapter_recirc_span: Optional[dict] = None
+    """A RESERVATION for a schedule-rewiring member's span on the
+    MULTISITE route: ports and passes only, no weights
+    (vllm.adaptation.recirculation.SPAN_DECLARATION_KEYS). The per-pass
+    KV caches a span needs can only be declared before the worker asks
+    for the KV-cache spec, and on that route the member has not been
+    loaded yet at that moment — so the SPAN is declared here and the
+    member fills it at load_adapter time. See
+    vllm.adaptation.protocol.REEXECUTION_ROUTES."""
     enable_adapters: bool = False
     """Enable multi-adapter serving. When True, the model is constructed
     with adapter-aware decoder layers that support dynamic adapter loading."""

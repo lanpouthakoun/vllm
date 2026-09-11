@@ -1111,7 +1111,19 @@ def _multi_adapter_forward(
     # An off-diagonal member's readout is applied ON THE WAY INTO the
     # span, not as a blend at this port, so it must not also run here —
     # applying it twice would square a non-identity readout.
+    #
+    # Every OTHER member co-mounted at this port does blend here, first,
+    # in load order, and the span is then entered with the blended
+    # stream.  That order is declared
+    # (vllm.adaptation.protocol.SPAN_COMOUNT_ORDER ==
+    # "diagonal_then_span") and it is the HF engine's own
+    # (adapters.mounting.AdapterModel._apply_leaf with the rewiring
+    # record last), which is the ordering the library's serving builder
+    # enforces when it declares the span.
     recirc = getattr(layer_self, "_adapter_recirc", None)
+    # None while a RESERVED span is unfilled: the shadow caches exist but
+    # no member drives them, so nothing is skipped here and the span
+    # below stays inert.
     recirc_id = recirc.adapter_int_id if recirc is not None else None
     for str_id, adapter in layer_self.served_adapters.items():
         int_id = int(str_id)
@@ -1130,8 +1142,8 @@ def _multi_adapter_forward(
     # times, from the stream leaving this block.  Runs after every
     # same-port blend so the span is entered with the fully adapted
     # stream, matching adapters.mounting._apply_leaf's ordering.
-    if recirc is not None and not recirc.depth and (
-            active_ids is None or recirc_id in active_ids):
+    if recirc is not None and recirc_id is not None and not recirc.depth \
+            and (active_ids is None or recirc_id in active_ids):
         from vllm.adaptation.recirculation import run_recirculation
         mask_buf = layer_self._adapter_combined_masks.get(recirc_id)
         num_tokens = new_stream.shape[0]

@@ -15,6 +15,9 @@ __all__ = [
     "HAVE_PAIR_PORTS",
     "SUPPORTED_WRITE_LABELS",
     "MULTISITE_HONOURS_UNCHUNKED_PREFILL",
+    "REEXECUTION_ROUTES",
+    "SPAN_COMOUNT_ORDER",
+    "CARRIES_ADAPTER_DECODE_STATE",
     "SERVING_REQUIREMENT_ATTRS",
     "CARRIER_DTYPE_ATTR",
     "CARRIER_DTYPE_STAMP",
@@ -244,6 +247,91 @@ SUPPORTED_WRITE_LABELS = frozenset({"replace", "interpolate"})
 # refusing such a member itself — the same "unknown is not yes" rule
 # that governs SUPPORTED_WRITE_LABELS above.
 MULTISITE_HONOURS_UNCHUNKED_PREFILL = True
+
+# ---------------------------------------------------------------------
+# Span re-execution: WHICH ROUTES can run one.
+#
+# A schedule-rewiring member (F_out preceding F_in, host_reexecute) needs
+# per-pass KV caches, and those can only be declared into
+# ``compilation_config.static_forward_context`` BEFORE the worker asks
+# for the KV-cache spec.  That timing — not the hook, not the layer
+# loop — is the whole constraint, so the answer is a set of ROUTES and
+# not a yes/no:
+#
+#   ``baked``              the member rides ``VllmConfig.adapter_config``
+#                          at construction.  ``install_recirculation``
+#                          reads the plan off it and registers the
+#                          shadows.  This is the route the pair axis
+#                          shipped with.
+#   ``multisite_reserved`` the SPAN is declared at engine-config time on
+#                          ``EngineArgs.adapter_recirc_span`` — ports and
+#                          passes only, no weights — which reserves the
+#                          shadow layers in the same window the baked
+#                          route uses.  The member itself then arrives
+#                          the ordinary multisite way, by
+#                          ``collective_rpc("load_adapter", ...)``, and
+#                          FILLS the reservation
+#                          (``recirculation.fill_reserved_span``), which
+#                          verifies its ports and passes against what was
+#                          reserved and refuses on any mismatch.  This is
+#                          what lets a rewiring member be served ALONGSIDE
+#                          other members — the composed member's case.
+#
+# An UNRESERVED multisite load is still refused, by the same
+# ``refuse_rewired`` and for the same reason it always was: at that
+# moment the caches can no longer be created.  A builder that cannot
+# find this name is talking to a fork that predates the reservation
+# route and must keep to ``baked`` — the same "unknown is not yes" rule
+# that governs SUPPORTED_WRITE_LABELS.
+REEXECUTION_ROUTES = frozenset({"baked", "multisite_reserved"})
+
+# The COMPOSITION ORDER at a span's input port, when other members are
+# co-mounted there.  Declared because it is a semantic choice and the
+# library has to make the same one.
+#
+# ``diagonal_then_span``: every ordinary (diagonal) member mounted at the
+# span's input port blends into the stream FIRST, in load order, and the
+# span is then entered with the fully blended stream; the member's W
+# writes the re-executed result back at that same port.  This is exactly
+# ``adapters.mounting.AdapterModel._apply_leaf``'s ordering when the
+# rewiring record is LAST in the record list, which is the ordering the
+# library's serving builder enforces when it declares the span.
+#
+# Members mounted INSIDE the span (at any layer the span re-executes)
+# fire on EVERY pass — the host's own plus each re-execution — because
+# the span re-runs the adapter-wrapped decoder layers themselves.  That
+# is the HF engine's semantics too (docs/recirculation-serving.md §2.5:
+# "a co-mounted leaf inside the re-executed span fires on every pass"),
+# and it is the reason a stateful member is mounted inside the span at
+# all: the loop is what re-develops its state.
+SPAN_COMOUNT_ORDER = "diagonal_then_span"
+
+# ---------------------------------------------------------------------
+# Per-request ADAPTER state across decode steps: this fork does NOT
+# carry one, and says so.
+#
+# ``adapters.mounting.Mount.decode_state`` asks the engine to carry a
+# per-request ``State`` produced by the leaf's T over the prompt and to
+# hand it to R at every decode step.  The HF engine does that
+# (``AdapterModel._apply_leaf``: a fresh State is scanned over the
+# prompt on the S > 1 forward, kept detached, advanced once per decoded
+# position, and dropped by ``reset_adapter_states()``).
+#
+# Nothing in ``vllm/adaptation/`` owns per-request adapter state.  Doing
+# it correctly means a ``(max_num_seqs, ...)`` slot per member, indexed
+# by the running request's slot, advanced exactly once per decoded
+# position, and zeroed on request start, preemption and recompute — and
+# vLLM reorders, preempts and recomputes freely.  Until that exists, a
+# member whose TRAINED function read a carried State would serve as a
+# fresh-state singleton at every decode step: a DIFFERENT function,
+# fluently and with no error.
+#
+# So the honest answer is False, and it is a NAME so the library can ask
+# instead of assuming.  ``adapters/serving.py::refuse_decode_state``
+# refuses such a member by name on it, and ``WorkerBase.load_adapter``
+# re-checks the manifest flag and refuses there too — because a member
+# that reaches the worker is past every library-side guard.
+CARRIES_ADAPTER_DECODE_STATE = False
 
 # The leaf attributes that carry a declaration.  Named here because the
 # fork READS them off a reconstructed member: they travel with the class,

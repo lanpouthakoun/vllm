@@ -482,6 +482,19 @@ class EngineArgs:
     # MULTISITE_HONOURS_UNCHUNKED_PREFILL is the capability flag that
     # tells the builder this field is read.
     adapter_serving_requirements: Optional[dict] = None
+    # A RESERVATION for a schedule-rewiring member's span, on the
+    # MULTISITE route.  Same timing problem as the requirements above and
+    # the same remedy: the per-pass KV caches a span needs can only be
+    # declared into compilation_config.static_forward_context BEFORE the
+    # worker asks for the KV-cache spec, and on the multisite route the
+    # member itself does not exist yet at that moment.  So the SPAN —
+    # ports and passes, no weights — is declared here instead
+    # (vllm.adaptation.recirculation.SPAN_DECLARATION_KEYS), and the
+    # member fills it when it lands by collective_rpc("load_adapter"),
+    # which checks its ports against the reservation and refuses on a
+    # mismatch.  vllm/adaptation/protocol.py REEXECUTION_ROUTES is the
+    # capability name that tells a builder this field is read.
+    adapter_recirc_span: Optional[dict] = None
     enable_adapters: bool = False
     max_adapters: int = 256
     max_cpu_adapters: int = 1024
@@ -1165,6 +1178,21 @@ class EngineArgs:
                     "enforce_eager=True before compilation is "
                     "configured.", _declared["declared_by"] or "(unnamed)")
                 self.enforce_eager = True
+        # A RESERVED span is Python control flow re-entering the decoder
+        # stack and swapping each attention module's layer_name between
+        # passes — the same thing CUDA-graph capture and the general
+        # shape compile strip, and the same reason the baked route forces
+        # eager below.  Forced here because on the multisite route there
+        # is no member to inspect yet.
+        if self.adapter_recirc_span and not self.enforce_eager:
+            logger.warning(
+                "a schedule-rewiring span is RESERVED "
+                "(adapter_recirc_span=%s); forcing enforce_eager=True "
+                "before compilation is configured — the span loop is "
+                "Python control flow that re-enters the decoder stack "
+                "and swaps attention layer names between passes.",
+                self.adapter_recirc_span)
+            self.enforce_eager = True
         if self.adapter_config and not self.enforce_eager:
             from vllm.adaptation.recirculation import config_rewires
             from vllm.adaptation.specs import adapter_config_needs_eager
@@ -1512,6 +1540,7 @@ class EngineArgs:
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
             adapter_config=self.adapter_config,
+            adapter_recirc_span=self.adapter_recirc_span,
             enable_adapters=self.enable_adapters,
             max_adapters=self.max_adapters,
             max_cpu_adapters=self.max_cpu_adapters,
@@ -1666,6 +1695,33 @@ class EngineArgs:
                     "enable_chunked_prefill=False and "
                     "max_num_batched_tokens>=max_model_len=%d.",
                     declared["declared_by"] or "(unnamed)",
+                    model_config.max_model_len)
+            self.enable_chunked_prefill = False
+            if needs_budget_raise:
+                self.max_num_batched_tokens = model_config.max_model_len
+        # A RESERVED span takes the SAME two settings as a baked one and
+        # for exactly the same reasons (below): a second prefill chunk
+        # would re-enter the span with only that chunk's queries against
+        # per-pass caches holding the earlier chunks' keys, and a
+        # prefix-cache block cannot distinguish the host's pass from the
+        # k extra ones that share its block table.  Forced here because
+        # on the multisite route the member does not exist yet.
+        if self.adapter_recirc_span:
+            if self.enable_prefix_caching:
+                logger.warning(
+                    "a schedule-rewiring span is RESERVED "
+                    "(adapter_recirc_span); forcing "
+                    "enable_prefix_caching=False.")
+                self.enable_prefix_caching = False
+            needs_budget_raise = (
+                self.max_num_batched_tokens is None
+                or self.max_num_batched_tokens < model_config.max_model_len)
+            if self.enable_chunked_prefill or needs_budget_raise:
+                logger.warning(
+                    "a schedule-rewiring span is RESERVED "
+                    "(adapter_recirc_span); forcing unchunked prefill "
+                    "(enable_chunked_prefill=False, "
+                    "max_num_batched_tokens>=max_model_len=%d).",
                     model_config.max_model_len)
             self.enable_chunked_prefill = False
             if needs_budget_raise:

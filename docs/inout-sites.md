@@ -322,6 +322,65 @@ baseline an order of magnitude above the HF path.
   already had for sequence-mixing members: `enforce_eager=True`,
   `enable_chunked_prefill=False` with `max_num_batched_tokens ≥
   max_model_len`, and `enable_prefix_caching=False`.
+- **The RESERVED multisite route (2026-09-11).** §7's first item, built.
+  A span can be declared at engine-config time on
+  `EngineArgs.adapter_recirc_span` — ports and passes only, no weights
+  (`recirculation.SPAN_DECLARATION_KEYS`, a strict subset of the
+  `adapter_config` keys, so `plan_from_adapter_config` validates both and
+  there is one place that decides what a span means). The declaration
+  reaches `install_recirculation` in the same window the baked route uses,
+  so the shadow caches are registered before the KV-cache spec is read;
+  the member itself then arrives the ordinary multisite way, by
+  `collective_rpc("load_adapter", ...)`, and FILLS the reservation
+  (`fill_reserved_span`), which checks its input layer, both ports and its
+  pass count against what was reserved and refuses on any mismatch. An
+  UNFILLED reservation is inert — `run_recirculation` is never reached and
+  the host's layers run exactly once — so a reserved member that never
+  loads degrades to the plain host, not to a silently wrong one. The same
+  engine policy (eager, unchunked prefill, prefix caching off, PP=1) is
+  forced from the reservation, because on that route there is no member to
+  inspect at engine-config time. `protocol.REEXECUTION_ROUTES` declares
+  both routes so a builder asks instead of assuming; before it existed
+  `adapters/serving.py` refused every rewiring member, including the baked
+  one the fork had been serving since this work landed.
+- **CO-MOUNTED members, at the input port and inside the span.** Both were
+  needed by the composed member of
+  `campaign/cartridge_readout/longhealth_raw` sub-lane B (a reader head at
+  every layer, so also at the span's input port; two scanned leaves at the
+  span's first layer, so inside it) and the first was refused outright as
+  "undefined". It is defined and declared now:
+  `protocol.SPAN_COMOUNT_ORDER == "diagonal_then_span"` — every ordinary
+  member at the input port blends into the stream FIRST, in load order,
+  and the span is entered with the blended stream, which is exactly
+  `adapters.mounting.AdapterModel._apply_leaf`'s ordering with the
+  rewiring record LAST. The library's builder enforces that order
+  (`adapters/serving.py::_rewired_last`, which is what makes the fork's
+  insertion-order blend agree), and two rewiring members at one port are
+  still refused — two spans over one stream have no defined nesting order.
+  Members inside the span fire on every pass (`1 + passes`), which already
+  followed from re-running the adapter-wrapped layers but was nothing
+  anyone could rely on; it is pinned per pass and per phase now, together
+  with per-request segmentation surviving the re-execution.
+- **The P axis, as far as it goes.** A member active only at prefill and
+  one active at both phases can be co-mounted inside a span and their
+  masks partition the batch exactly (`test_composed_span.py::
+  TestPhaseMasksInsideTheSpan`). What the engine does NOT have is a
+  per-request adapter State: `protocol.CARRIES_ADAPTER_DECODE_STATE` is
+  False and a member whose mount asked for one is refused by name
+  (`recirculation.refuse_decode_state`,
+  `adapters/serving.py::refuse_decode_state`) rather than served as a
+  fresh-state singleton at every decoded position. That refusal closed a
+  SILENT gap: the library recorded `Mount.decode_state` only for a pipe,
+  so a diagonal carried-state member exported as an ordinary one and
+  passed every guard on both sides.
+
+Tests: 48 further CPU tests in `tests/adaptation/test_composed_span.py`
+(the reservation, its refusals, gate-0 identity with the whole composed
+member on both residual contracts, per-pass firing, the composition order
+at the input port, the phase split inside the span, and the two things
+that stay refused), plus the GPU smoke
+`tests/adaptation/smoke_composed_gpu.py`. `tests/adaptation` is
+**409 passed** with all of it, from 360 before.
 
 Tests: 73 CPU tests in `tests/adaptation/test_inout_sites.py`, including
 cached-decode-equals-full-forward for prefill ∈ {1, 3, 6} × passes ∈
@@ -351,7 +410,10 @@ degrades silently.
 | **output port not a write port** | Only `block_input` and `block_output` are legal write ports (the library's `WRITE_PORTS`): the engine resumes the host's layer loop there, and a decoder layer cannot be resumed from the middle of its own forward. |
 | **output port at or after the input port** | Writing forward past the read point would *skip* the host's computation of the layers in between rather than re-run them. |
 | **more than one input layer** | Each span would need its own per-pass KV sets and a defined nesting order. |
-| **another member co-mounted at the input port** | The span re-execution replaces the whole stream at that port, so the composition order with a co-mounted member is undefined. |
+| ~~another member co-mounted at the input port~~ | **No longer refused (2026-09-11).** The order is defined and declared: `SPAN_COMOUNT_ORDER == "diagonal_then_span"`. A SECOND rewiring member at the same port still is, and so is a span whose driver cannot be identified. |
+| **a KV-transfer connector** — restated, because it is the sharpest refusal here | Not bookkeeping: **uninitialised memory**. A connector injects K/V by layer NAME; the shadow layers' names are in no row store, so nothing is injected into them, while they SHARE the host's block table and slot mapping. The injected prefix positions are allocated in every pass's cache tensor and written in none, and the span's queries attend causally over exactly those positions. Seeding each pass with the same rows is not a fix either: `adapters/mounting.py::_rewire_span` keys its per-pass cache on the HOST's `use_cache`, so a member trained with a `past_key_values` prefix and `use_cache=False` ran its passes CACHE-FREE and never saw that prefix inside its span. An external KV prefix and a span are mutually exclusive for one served member. |
+| **a member whose mount asked for an engine-carried `State`** (`Mount.decode_state` on a diagonal mount) | This engine owns no per-request adapter state (`CARRIES_ADAPTER_DECODE_STATE = False`). Serving it would call `readout()` with `state=None` at every decoded position — a fresh-state singleton where the trained function was a scan carried from the prompt, fluently and with no error. `check_adaptation_supported` would NOT have caught it (it only refuses a `.mixer` declaring `stateful=True`), so the refusal is keyed on the manifest's mount flag. |
+| **an unreserved rewiring member on the multisite route** | Unchanged in substance, sharper in remedy: the caches can no longer be created at `load_adapter` time, so RESERVE the span before `LLM(...)` or bake the member. |
 | **a span layer with no attention** | Nothing to allocate a per-pass cache for; Mamba/linear-attention layers carry engine state this route does not duplicate. |
 | **`passes` not an int ≥ 1** | Including `bool`, which would otherwise sneak through as 1. |
 | **library without the pair-port API** | `adapters.sites` must export `WRITE_PORTS`, `PORT_ORDER`, `validate_write_port`, `port_order`. The fork imports them **optionally** (so every diagonal adapter keeps working against an older library) but never substitutes a private copy — that is the silent-drift bug class the hard `adapters.sites` import exists to kill. A rewiring config against an old library raises. |
@@ -396,12 +458,21 @@ untouched by this change.
 
 ## 7. What remains for a full route
 
-- **Multisite.** Needs the KV-cache spec to accept late additions, or the
-  member set to be declared at engine construction so the spec can
-  account for it. The second is much cheaper and is probably the right
-  shape: a `max_recirc_passes` / span declaration on `EngineArgs` that
-  reserves the shadow layers up front, with `load_adapter` then only
-  allowed to fill a reserved span.
+- ~~**Multisite.**~~ **Done (2026-09-11)**, in the shape this item
+  predicted: a span declaration on `EngineArgs`
+  (`adapter_recirc_span`) that reserves the shadow layers up front, with
+  `load_adapter` only allowed to fill a reserved span. See §4.
+- **An external KV prefix alongside a span.** Refused, and §5 says why
+  it is not a matter of plumbing: the fix would have to change what the
+  HF engine trains, not only what this one serves. Nothing to do here
+  until the library decides what a re-executed pass should see of an
+  external prefix.
+- **Per-request adapter `State`.** Still absent, and now DECLARED absent
+  (`CARRIES_ADAPTER_DECODE_STATE`). It needs a `(max_num_seqs, ...)` slot
+  per member, indexed by the running request's slot, advanced exactly once
+  per decoded position, and zeroed on request start, preemption and
+  recompute. The phase masks plus the span's per-pass KV cover the part of
+  the P axis that does not need it.
 - **Chunked prefill.** Needs the pipe's own stream to be checkpointed at
   chunk boundaries — i.e. the span's input for chunk `c` must be the
   recirculated stream, not the host's, which means storing one hidden
