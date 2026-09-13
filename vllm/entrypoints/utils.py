@@ -4,6 +4,7 @@
 import asyncio
 import dataclasses
 import functools
+import hashlib
 import os
 from argparse import Namespace
 from typing import Any, Optional, Union
@@ -206,6 +207,42 @@ def get_max_tokens(max_model_len: int, request: Union[ChatCompletionRequest,
                if val is not None)
 
 
+#: Any single bytes payload longer than this is summarised, never printed, in
+#: the "non-default args" log record. Adapter blueprints travel through
+#: ``EngineArgs.adapter_config`` as a serialisable dict whose ``state_dict``
+#: entries carry raw tensor bytes (``{"__adapter_t": True, "data": b"..."}``).
+#: Python renders those bytes as a ``\xNN`` escape repr — four characters per
+#: byte — so logging the dict verbatim wrote ~620 MB per job for a 56 M-parameter
+#: readout and 3.7 GB across one nine-cell wave. The values are opaque weights:
+#: nothing is diagnosable from them that the length and digest do not say.
+_MAX_LOGGED_BYTES = 64
+
+
+def _loggable(value: Any, _depth: int = 0) -> Any:
+    """Return ``value`` with large binary payloads replaced by a digest.
+
+    Recurses through dicts, lists and tuples so a payload nested inside an
+    adapter blueprint is caught wherever it sits. Structure, keys, ordering and
+    every non-bytes value are preserved exactly, so the log record still
+    identifies the adapter completely.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        if len(raw) <= _MAX_LOGGED_BYTES:
+            return raw
+        return (f"<bytes len={len(raw)} "
+                f"sha256={hashlib.sha256(raw).hexdigest()[:16]}>")
+    if _depth >= 12:
+        return value
+    if isinstance(value, dict):
+        return {k: _loggable(v, _depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_loggable(v, _depth + 1) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_loggable(v, _depth + 1) for v in value)
+    return value
+
+
 def log_non_default_args(args: Union[Namespace, EngineArgs]):
     non_default_args = {}
 
@@ -230,4 +267,4 @@ def log_non_default_args(args: Union[Namespace, EngineArgs]):
         raise TypeError("Unsupported argument type. " \
         "Must be Namespace or EngineArgs instance.")
 
-    logger.info("non-default args: %s", non_default_args)
+    logger.info("non-default args: %s", _loggable(non_default_args))
